@@ -1,0 +1,17 @@
+node_modules
+dist
+src/generated
+coverage
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+docs
+test
+*.md
+*.log
+Dockerfile
+docker-compose*.yml
+.dockerignore
+/storage

@@ -1,0 +1,3151 @@
+// Phase 1: staff access control (users, sessions, roles, permissions, audit).
+// Phase 2: customers/brands, assets, master data, patterns, account tokens.
+// Phase 3: samples, artwork, quotations, approvals, payments, terms, production snapshot.
+// Phase 4: factory jobs, workflow templates, stages, assignments, blockers, QC, rework, timeline.
+// Samples, orders, jobs, payments arrive in later phases.
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  INVITED
+  DISABLED
+}
+
+/// Internal Benue Print staff member. Soft-deleted via deletedAt (never hard-deleted).
+model User {
+  id                String     @id @default(uuid()) @db.Uuid
+  name              String
+  /// Always stored lower-cased and trimmed.
+  email             String     @unique
+  phone             String?
+  passwordHash      String     @map("password_hash")
+  status            UserStatus @default(ACTIVE)
+  /// Denormalised kill switch kept in sync with `status` (true only when ACTIVE).
+  isActive          Boolean    @default(true) @map("is_active")
+  lastLoginAt       DateTime?  @map("last_login_at")
+  passwordChangedAt DateTime?  @map("password_changed_at")
+  createdAt         DateTime   @default(now()) @map("created_at")
+  updatedAt         DateTime   @updatedAt @map("updated_at")
+  deletedAt         DateTime?  @map("deleted_at")
+
+  roles               UserRole[]           @relation("UserRoleUser")
+  assignedRoles       UserRole[]           @relation("UserRoleAssigner")
+  sessions            Session[]
+  auditLogs           AuditLog[]
+  tokens              UserToken[]
+  assignedSamples     Sample[]             @relation("SampleAssignedSales")
+  sampleNotes         SampleNote[]
+  stageAssignments    StageAssignment[]
+  responsibilityRules ResponsibilityRule[] @relation("ResponsibilityPrimary")
+  staffCapacities     StaffCapacity[]
+  qcInspections       QcInspection[]
+  jobNotes            JobNote[]
+  jobActivities       JobActivity[]
+  uploadedAssets      Asset[]
+
+  notificationLocale        String?                      @map("notification_locale")
+  notifications             Notification[]
+  notificationPreferences   UserNotificationPreference[]
+  techPackVersionsGenerated TechPackVersion[]            @relation("TechPackGenerated")
+  techPackVersionsIssued    TechPackVersion[]            @relation("TechPackIssued")
+  qrTokensCreated           FactoryJobQrToken[]          @relation("QrCreated")
+  qrTokensRevoked           FactoryJobQrToken[]          @relation("QrRevoked")
+
+  @@index([status])
+  @@index([deletedAt])
+  @@index([name])
+  @@map("users")
+}
+
+model Role {
+  id          String    @id @default(uuid()) @db.Uuid
+  name        String
+  /// Stable machine identifier, e.g. SALES. Immutable after creation.
+  code        String    @unique
+  description String?
+  /// System roles are seeded, cannot be deleted, and cannot change code.
+  isSystem    Boolean   @default(false) @map("is_system")
+  isActive    Boolean   @default(true) @map("is_active")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  deletedAt   DateTime? @map("deleted_at")
+
+  users       UserRole[]
+  permissions RolePermission[]
+
+  @@index([deletedAt])
+  @@map("roles")
+}
+
+model Permission {
+  id          String   @id @default(uuid()) @db.Uuid
+  /// `<resource>.<action>`, e.g. users.manage. Catalogue is defined in code and synced by the seed.
+  code        String   @unique
+  description String
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  roles RolePermission[]
+
+  @@map("permissions")
+}
+
+model UserRole {
+  userId     String   @map("user_id") @db.Uuid
+  roleId     String   @map("role_id") @db.Uuid
+  assignedAt DateTime @default(now()) @map("assigned_at")
+  assignedBy String?  @map("assigned_by") @db.Uuid
+
+  user     User  @relation("UserRoleUser", fields: [userId], references: [id], onDelete: Cascade)
+  role     Role  @relation(fields: [roleId], references: [id], onDelete: Restrict)
+  assigner User? @relation("UserRoleAssigner", fields: [assignedBy], references: [id], onDelete: SetNull)
+
+  @@id([userId, roleId])
+  @@index([roleId])
+  @@map("user_roles")
+}
+
+model RolePermission {
+  roleId       String @map("role_id") @db.Uuid
+  permissionId String @map("permission_id") @db.Uuid
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Restrict)
+
+  @@id([roleId, permissionId])
+  @@index([permissionId])
+  @@map("role_permissions")
+}
+
+/// One row per login. The refresh token is `<session id>.<secret>`; only a SHA-256 of the secret is stored.
+model Session {
+  id               String    @id @default(uuid()) @db.Uuid
+  userId           String    @map("user_id") @db.Uuid
+  refreshTokenHash String    @map("refresh_token_hash")
+  userAgent        String?   @map("user_agent")
+  ipAddress        String?   @map("ip_address")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  lastUsedAt       DateTime? @map("last_used_at")
+  expiresAt        DateTime  @map("expires_at")
+  revokedAt        DateTime? @map("revoked_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+/// Append-only security/administrative audit trail (enforced by a DB trigger).
+model AuditLog {
+  id              String   @id @default(uuid()) @db.Uuid
+  actorUserId     String?  @map("actor_user_id") @db.Uuid
+  /// Set instead of actorUserId when a customer (portal account) caused the event.
+  actorCustomerId String?  @map("actor_customer_id") @db.Uuid
+  action          String
+  entityType      String   @map("entity_type")
+  entityId        String?  @map("entity_id")
+  metadata        Json?
+  ipAddress       String?  @map("ip_address")
+  userAgent       String?  @map("user_agent")
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  actor         User?     @relation(fields: [actorUserId], references: [id], onDelete: Restrict)
+  actorCustomer Customer? @relation("AuditActorCustomer", fields: [actorCustomerId], references: [id], onDelete: Restrict)
+
+  @@index([createdAt])
+  @@index([actorUserId])
+  @@index([actorCustomerId])
+  @@index([action])
+  @@index([entityType, entityId])
+  @@map("audit_logs")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 — infrastructure
+// ---------------------------------------------------------------------------
+
+/// Concurrency-safe human-readable references (CUS-000001, BRD-000001, ...).
+/// Incremented atomically with INSERT .. ON CONFLICT .. RETURNING inside the creator's transaction.
+model ReferenceSequence {
+  prefix    String   @id
+  lastValue Int      @default(0) @map("last_value")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("reference_sequences")
+}
+
+/// Records which default role-grant batches the seed has applied, so new
+/// default permissions reach existing roles exactly once without overwriting admin edits.
+model SeedGrantBatch {
+  key       String   @id
+  appliedAt DateTime @default(now()) @map("applied_at")
+
+  @@map("seed_grant_batches")
+}
+
+enum UserTokenType {
+  INVITATION
+  PASSWORD_RESET
+  /// Phase 7D: customer self-signup email verification (customer_account_tokens only).
+  EMAIL_VERIFICATION
+}
+
+/// Single-use account tokens. Token = `<id>.<secret>`; only sha256(secret) is stored.
+model UserToken {
+  id          String        @id @default(uuid()) @db.Uuid
+  userId      String        @map("user_id") @db.Uuid
+  type        UserTokenType
+  tokenHash   String        @map("token_hash")
+  expiresAt   DateTime      @map("expires_at")
+  consumedAt  DateTime?     @map("consumed_at")
+  revokedAt   DateTime?     @map("revoked_at")
+  createdById String?       @map("created_by_id") @db.Uuid
+  createdAt   DateTime      @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, type])
+  @@index([expiresAt])
+  @@map("user_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7A — customer portal accounts (separate identity from staff users)
+// ---------------------------------------------------------------------------
+
+enum CustomerAccountStatus {
+  INVITED
+  /// Phase 7D: self-registered, password chosen, email not yet verified. Cannot log in.
+  PENDING_VERIFICATION
+  ACTIVE
+  DISABLED
+}
+
+/// The portal login of exactly one Customer. Deliberately NOT a User: it has no roles or
+/// permissions and its sessions and tokens live in their own tables.
+model CustomerAccount {
+  id                String                @id @default(uuid()) @db.Uuid
+  customerId        String                @unique @map("customer_id") @db.Uuid
+  /// Always stored lower-cased and trimmed.
+  email             String                @unique
+  /// Null until the invitation is accepted (CHECK: an ACTIVE account has a password).
+  passwordHash      String?               @map("password_hash")
+  status            CustomerAccountStatus @default(INVITED)
+  lastLoginAt       DateTime?             @map("last_login_at")
+  passwordChangedAt DateTime?             @map("password_changed_at")
+  createdByUserId   String?               @map("created_by_user_id") @db.Uuid
+  /// Phase 7D: set when the owner proved control of the email (invitation accepted or verification link used).
+  emailVerifiedAt   DateTime?             @map("email_verified_at")
+  /// Phase 7D: true when the customer created the account themselves (no staff user involved).
+  selfRegistered    Boolean               @default(false) @map("self_registered")
+  /// Phase 7D: when the visitor ticked the site Terms / Privacy boxes at signup (no legal-version model exists yet).
+  termsAcceptedAt   DateTime?             @map("terms_accepted_at")
+  privacyAcceptedAt DateTime?             @map("privacy_accepted_at")
+  createdAt         DateTime              @default(now()) @map("created_at")
+  updatedAt         DateTime              @updatedAt @map("updated_at")
+
+  customer Customer               @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  sessions CustomerSession[]
+  tokens   CustomerAccountToken[]
+
+  @@index([status])
+  @@map("customer_accounts")
+}
+
+model CustomerSession {
+  id               String    @id @default(uuid()) @db.Uuid
+  accountId        String    @map("account_id") @db.Uuid
+  refreshTokenHash String    @map("refresh_token_hash")
+  userAgent        String?   @map("user_agent")
+  ipAddress        String?   @map("ip_address")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  lastUsedAt       DateTime? @map("last_used_at")
+  expiresAt        DateTime  @map("expires_at")
+  revokedAt        DateTime? @map("revoked_at")
+
+  account CustomerAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@index([accountId])
+  @@index([expiresAt])
+  @@map("customer_sessions")
+}
+
+/// Single-use invitation / password-reset tokens of a customer account (`<id>.<secret>`, sha256 stored).
+model CustomerAccountToken {
+  id         String        @id @default(uuid()) @db.Uuid
+  accountId  String        @map("account_id") @db.Uuid
+  type       UserTokenType
+  tokenHash  String        @map("token_hash")
+  expiresAt  DateTime      @map("expires_at")
+  consumedAt DateTime?     @map("consumed_at")
+  revokedAt  DateTime?     @map("revoked_at")
+  createdAt  DateTime      @default(now()) @map("created_at")
+
+  account CustomerAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@index([accountId, type])
+  @@index([expiresAt])
+  @@map("customer_account_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 — customers
+// ---------------------------------------------------------------------------
+
+enum CustomerStatus {
+  ACTIVE
+  LEAD
+  INACTIVE
+  BLOCKED
+  ARCHIVED
+}
+
+enum BrandStatus {
+  ACTIVE
+  INACTIVE
+  ARCHIVED
+}
+
+enum ContactRole {
+  OWNER
+  PRODUCTION
+  FINANCE
+  SHIPPING
+  OTHER
+}
+
+enum AddressType {
+  BILLING
+  SHIPPING
+  PICKUP
+  OTHER
+}
+
+/// External client / brand owner. Not a staff user.
+model Customer {
+  id             String         @id @default(uuid()) @db.Uuid
+  customerNumber String         @unique @map("customer_number")
+  displayName    String         @map("display_name")
+  email          String?
+  phone          String?
+  whatsapp       String?
+  country        String?
+  city           String?
+  instagram      String?
+  source         String?
+  notes          String?
+  status         CustomerStatus @default(ACTIVE)
+  createdAt      DateTime       @default(now()) @map("created_at")
+  updatedAt      DateTime       @updatedAt @map("updated_at")
+  archivedAt     DateTime?      @map("archived_at")
+
+  brands           Brand[]
+  contacts         CustomerContact[]
+  addresses        CustomerAddress[]
+  attachments      AssetAttachment[]
+  orders           Order[]
+  samples          Sample[]
+  termsAcceptances SampleTermsAcceptance[]
+
+  portalAccount       CustomerAccount?
+  responsibilityRules ResponsibilityRule[]
+  auditEntries        AuditLog[]            @relation("AuditActorCustomer")
+  uploadedAssets      Asset[]               @relation("AssetUploadedByCustomer")
+  portalSamples       Sample[]              @relation("SampleCreatedByCustomer")
+  portalStatusChanges SampleStatusHistory[] @relation("HistoryActorCustomer")
+  approvalsRequested  Approval[]            @relation("ApprovalRequestedByCustomer")
+  approvalsResponded  Approval[]            @relation("ApprovalRespondedByCustomer")
+  paymentsSubmitted   Payment[]             @relation("PaymentCreatedByCustomer")
+  ordersPlaced        Order[]               @relation("OrderCreatedByCustomer")
+  orderActivities     OrderActivity[]       @relation("OrderActivityActorCustomer")
+  quotationDecisions  QuotationVersion[]    @relation("QuotationDecidedByCustomer")
+
+  preferredLocale         String?                          @map("preferred_locale")
+  notifications           Notification[]
+  notificationPreferences CustomerNotificationPreference[]
+
+  @@index([email])
+  @@index([phone])
+  @@index([whatsapp])
+  @@index([status])
+  @@index([createdAt])
+  @@index([displayName])
+  @@map("customers")
+}
+
+model Brand {
+  id             String      @id @default(uuid()) @db.Uuid
+  brandNumber    String      @unique @map("brand_number")
+  customerId     String      @map("customer_id") @db.Uuid
+  name           String
+  instagram      String?
+  website        String?
+  description    String?
+  primaryColor   String?     @map("primary_color")
+  secondaryColor String?     @map("secondary_color")
+  status         BrandStatus @default(ACTIVE)
+  createdAt      DateTime    @default(now()) @map("created_at")
+  updatedAt      DateTime    @updatedAt @map("updated_at")
+  archivedAt     DateTime?   @map("archived_at")
+
+  customer    Customer          @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  attachments AssetAttachment[]
+  orders      Order[]
+  samples     Sample[]
+  artworks    Artwork[]
+
+  @@index([customerId])
+  @@index([name])
+  @@index([status])
+  @@map("brands")
+}
+
+model CustomerContact {
+  id         String      @id @default(uuid()) @db.Uuid
+  customerId String      @map("customer_id") @db.Uuid
+  role       ContactRole @default(OTHER)
+  name       String
+  jobTitle   String?     @map("job_title")
+  email      String?
+  phone      String?
+  whatsapp   String?
+  isPrimary  Boolean     @default(false) @map("is_primary")
+  notes      String?
+  createdAt  DateTime    @default(now()) @map("created_at")
+  updatedAt  DateTime    @updatedAt @map("updated_at")
+  archivedAt DateTime?   @map("archived_at")
+
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+
+  notifications Notification[]
+
+  @@index([customerId])
+  @@map("customer_contacts")
+}
+
+model CustomerAddress {
+  id           String      @id @default(uuid()) @db.Uuid
+  customerId   String      @map("customer_id") @db.Uuid
+  type         AddressType @default(SHIPPING)
+  country      String
+  state        String?
+  city         String
+  area         String?
+  addressLine1 String      @map("address_line1")
+  addressLine2 String?     @map("address_line2")
+  postalCode   String?     @map("postal_code")
+  notes        String?
+  isDefault    Boolean     @default(false) @map("is_default")
+  createdAt    DateTime    @default(now()) @map("created_at")
+  updatedAt    DateTime    @updatedAt @map("updated_at")
+  archivedAt   DateTime?   @map("archived_at")
+
+  customer          Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  preferredByOrders Order[]  @relation("OrderPreferredAddress")
+
+  @@index([customerId])
+  @@map("customer_addresses")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 — assets (metadata only; bytes live in object storage)
+// ---------------------------------------------------------------------------
+
+enum AssetType {
+  LOGO
+  ARTWORK
+  MOCKUP
+  REFERENCE
+  SIZE_CHART
+  PATTERN
+  FABRIC_SWATCH
+  PAYMENT_PROOF
+  QC_PHOTO
+  TECH_PACK
+  LABEL
+  PACKAGING_REFERENCE
+  PRODUCTION_REFERENCE
+  STAGE_PHOTO
+  PATTERN_OUTPUT
+  PRINT_PROOF
+  DELIVERY_PROOF
+  OTHER
+}
+
+model Asset {
+  id                    String    @id @default(uuid()) @db.Uuid
+  type                  AssetType
+  originalName          String    @map("original_name")
+  description           String?
+  /// Sniffed from the file's magic bytes, never taken from the client.
+  mimeType              String    @map("mime_type")
+  sizeBytes             Int       @map("size_bytes")
+  storageProvider       String    @map("storage_provider")
+  /// Server-generated, never exposed through the API.
+  storageKey            String    @unique @map("storage_key")
+  checksum              String?
+  uploadedByStaffUserId String?   @map("uploaded_by_staff_user_id") @db.Uuid
+  /// Set when a customer uploaded the file through the portal (ownership of customer-visible files).
+  uploadedByCustomerId  String?   @map("uploaded_by_customer_id") @db.Uuid
+  createdAt             DateTime  @default(now()) @map("created_at")
+  archivedAt            DateTime? @map("archived_at")
+
+  uploadedBy         User?             @relation(fields: [uploadedByStaffUserId], references: [id], onDelete: SetNull)
+  uploadedByCustomer Customer?         @relation("AssetUploadedByCustomer", fields: [uploadedByCustomerId], references: [id], onDelete: SetNull)
+  shipmentProofs     Shipment[]
+  attachments        AssetAttachment[]
+  swatchFor          FabricColor[]
+  artworkVersions    ArtworkVersion[]
+  paymentProofs      Payment[]
+
+  techPackVersions TechPackVersion[]
+
+  @@index([type])
+  @@index([uploadedByStaffUserId])
+  @@index([uploadedByCustomerId])
+  @@index([createdAt])
+  @@map("assets")
+}
+
+/// Attaches an asset to exactly one Phase 2 entity. Real foreign keys (no
+/// polymorphic type/id pair); a CHECK constraint enforces exactly one target.
+/// Later phases add nullable columns (sample_id, ...) and extend the CHECK.
+model AssetAttachment {
+  id               String   @id @default(uuid()) @db.Uuid
+  assetId          String   @map("asset_id") @db.Uuid
+  customerId       String?  @map("customer_id") @db.Uuid
+  brandId          String?  @map("brand_id") @db.Uuid
+  fabricId         String?  @map("fabric_id") @db.Uuid
+  patternVersionId String?  @map("pattern_version_id") @db.Uuid
+  productTypeId    String?  @map("product_type_id") @db.Uuid
+  printMethodId    String?  @map("print_method_id") @db.Uuid
+  sampleId         String?  @map("sample_id") @db.Uuid
+  factoryJobId     String?  @map("factory_job_id") @db.Uuid
+  jobStageId       String?  @map("job_stage_id") @db.Uuid
+  qcInspectionId   String?  @map("qc_inspection_id") @db.Uuid
+  createdByUserId  String?  @map("created_by_user_id") @db.Uuid
+  /// Staff explicitly exposed this (sample) file to the customer. Default: staff-only.
+  customerVisible  Boolean  @default(false) @map("customer_visible")
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  asset          Asset           @relation(fields: [assetId], references: [id], onDelete: Restrict)
+  customer       Customer?       @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  brand          Brand?          @relation(fields: [brandId], references: [id], onDelete: Restrict)
+  fabric         Fabric?         @relation(fields: [fabricId], references: [id], onDelete: Restrict)
+  patternVersion PatternVersion? @relation(fields: [patternVersionId], references: [id], onDelete: Restrict)
+  productType    ProductType?    @relation(fields: [productTypeId], references: [id], onDelete: Restrict)
+  printMethod    PrintMethod?    @relation(fields: [printMethodId], references: [id], onDelete: Restrict)
+  sample         Sample?         @relation(fields: [sampleId], references: [id], onDelete: Restrict)
+  factoryJob     FactoryJob?     @relation(fields: [factoryJobId], references: [id], onDelete: Restrict)
+  jobStage       JobStage?       @relation(fields: [jobStageId], references: [id], onDelete: Restrict)
+  qcInspection   QcInspection?   @relation(fields: [qcInspectionId], references: [id], onDelete: Restrict)
+
+  @@unique([assetId, customerId])
+  @@unique([assetId, brandId])
+  @@unique([assetId, fabricId])
+  @@unique([assetId, patternVersionId])
+  @@unique([assetId, productTypeId])
+  @@unique([assetId, printMethodId])
+  @@unique([assetId, sampleId])
+  @@unique([assetId, factoryJobId])
+  @@unique([assetId, jobStageId])
+  @@unique([assetId, qcInspectionId])
+  @@index([customerId])
+  @@index([brandId])
+  @@index([fabricId])
+  @@index([patternVersionId])
+  @@index([productTypeId])
+  @@index([printMethodId])
+  @@index([sampleId])
+  @@index([factoryJobId])
+  @@index([jobStageId])
+  @@index([qcInspectionId])
+  @@map("asset_attachments")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 — master data
+// ---------------------------------------------------------------------------
+
+enum ProductCategory {
+  TOPS
+  BOTTOMS
+  OUTERWEAR
+  HEADWEAR
+  DRESSES
+  OTHER
+}
+
+model ProductType {
+  id               String           @id @default(uuid()) @db.Uuid
+  code             String           @unique
+  name             String
+  description      String?
+  category         ProductCategory?
+  isActive         Boolean          @default(true) @map("is_active")
+  sortOrder        Int              @default(0) @map("sort_order")
+  defaultSampleFee Decimal?         @map("default_sample_fee") @db.Decimal(12, 2)
+  createdAt        DateTime         @default(now()) @map("created_at")
+  updatedAt        DateTime         @updatedAt @map("updated_at")
+  archivedAt       DateTime?        @map("archived_at")
+
+  fabrics     ProductTypeFabric[]
+  patterns    Pattern[]
+  samples     Sample[]
+  attachments AssetAttachment[]
+
+  @@index([name])
+  @@index([isActive])
+  @@map("product_types")
+}
+
+model Fabric {
+  id              String    @id @default(uuid()) @db.Uuid
+  referenceNumber String    @unique @map("reference_number")
+  code            String    @unique
+  name            String
+  description     String?
+  composition     String?
+  minGsm          Int?      @map("min_gsm")
+  maxGsm          Int?      @map("max_gsm")
+  defaultGsm      Int?      @map("default_gsm")
+  /// Unit of measure for future inventory/pricing (e.g. KG, METER).
+  unit            String?
+  notes           String?
+  isActive        Boolean   @default(true) @map("is_active")
+  sortOrder       Int       @default(0) @map("sort_order")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+  archivedAt      DateTime? @map("archived_at")
+
+  colors       FabricColor[]
+  productTypes ProductTypeFabric[]
+  samples      Sample[]
+  attachments  AssetAttachment[]
+
+  @@index([name])
+  @@index([isActive])
+  @@map("fabrics")
+}
+
+/// A predefined colour offered for a fabric. Future samples may also carry
+/// free-form custom colours that never reference this table.
+model FabricColor {
+  id            String    @id @default(uuid()) @db.Uuid
+  fabricId      String    @map("fabric_id") @db.Uuid
+  name          String
+  internalCode  String?   @map("internal_code")
+  hex           String?
+  pantone       String?
+  swatchAssetId String?   @map("swatch_asset_id") @db.Uuid
+  isAvailable   Boolean   @default(true) @map("is_available")
+  isActive      Boolean   @default(true) @map("is_active")
+  sortOrder     Int       @default(0) @map("sort_order")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+  archivedAt    DateTime? @map("archived_at")
+
+  fabric      Fabric   @relation(fields: [fabricId], references: [id], onDelete: Restrict)
+  swatchAsset Asset?   @relation(fields: [swatchAssetId], references: [id], onDelete: SetNull)
+  samples     Sample[]
+
+  @@index([fabricId])
+  @@index([swatchAssetId])
+  @@map("fabric_colors")
+}
+
+/// Which fabrics suit which product types (guidance for the future configurator, not a hard rule).
+model ProductTypeFabric {
+  productTypeId String   @map("product_type_id") @db.Uuid
+  fabricId      String   @map("fabric_id") @db.Uuid
+  isRecommended Boolean  @default(false) @map("is_recommended")
+  isAllowed     Boolean  @default(true) @map("is_allowed")
+  notes         String?
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  productType ProductType @relation(fields: [productTypeId], references: [id], onDelete: Restrict)
+  fabric      Fabric      @relation(fields: [fabricId], references: [id], onDelete: Restrict)
+
+  @@id([productTypeId, fabricId])
+  @@index([fabricId])
+  @@map("product_type_fabrics")
+}
+
+enum PatternStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+}
+
+enum PatternVersionStatus {
+  DRAFT
+  APPROVED
+  SUPERSEDED
+}
+
+/// Reusable Benue Print fit. Content lives in immutable-once-approved PatternVersions.
+model Pattern {
+  id               String        @id @default(uuid()) @db.Uuid
+  referenceNumber  String        @unique @map("reference_number")
+  code             String        @unique
+  name             String
+  productTypeId    String        @map("product_type_id") @db.Uuid
+  description      String?
+  fitType          String?       @map("fit_type")
+  status           PatternStatus @default(DRAFT)
+  notes            String?
+  /// The approved version samples should reference by default.
+  currentVersionId String?       @unique @map("current_version_id") @db.Uuid
+  createdByUserId  String?       @map("created_by_user_id") @db.Uuid
+  createdAt        DateTime      @default(now()) @map("created_at")
+  updatedAt        DateTime      @updatedAt @map("updated_at")
+  archivedAt       DateTime?     @map("archived_at")
+
+  productType    ProductType      @relation(fields: [productTypeId], references: [id], onDelete: Restrict)
+  versions       PatternVersion[] @relation("PatternVersions")
+  currentVersion PatternVersion?  @relation("CurrentPatternVersion", fields: [currentVersionId], references: [id], onDelete: SetNull)
+
+  @@index([productTypeId])
+  @@index([status])
+  @@index([name])
+  @@map("patterns")
+}
+
+model PatternVersion {
+  id               String               @id @default(uuid()) @db.Uuid
+  patternId        String               @map("pattern_id") @db.Uuid
+  versionNumber    Int                  @map("version_number")
+  status           PatternVersionStatus @default(DRAFT)
+  notes            String?
+  approvedAt       DateTime?            @map("approved_at")
+  approvedByUserId String?              @map("approved_by_user_id") @db.Uuid
+  createdByUserId  String?              @map("created_by_user_id") @db.Uuid
+  createdAt        DateTime             @default(now()) @map("created_at")
+
+  pattern     Pattern           @relation("PatternVersions", fields: [patternId], references: [id], onDelete: Restrict)
+  currentFor  Pattern?          @relation("CurrentPatternVersion")
+  samples     Sample[]
+  attachments AssetAttachment[]
+
+  @@unique([patternId, versionNumber])
+  @@map("pattern_versions")
+}
+
+model SizeScale {
+  id          String    @id @default(uuid()) @db.Uuid
+  code        String    @unique
+  name        String
+  description String?
+  isActive    Boolean   @default(true) @map("is_active")
+  sortOrder   Int       @default(0) @map("sort_order")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  archivedAt  DateTime? @map("archived_at")
+
+  sizes SizeOption[]
+
+  @@map("size_scales")
+}
+
+model SizeOption {
+  id         String    @id @default(uuid()) @db.Uuid
+  scaleId    String    @map("scale_id") @db.Uuid
+  code       String
+  name       String
+  sortOrder  Int       @default(0) @map("sort_order")
+  isActive   Boolean   @default(true) @map("is_active")
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime  @updatedAt @map("updated_at")
+  archivedAt DateTime? @map("archived_at")
+
+  scale   SizeScale @relation(fields: [scaleId], references: [id], onDelete: Restrict)
+  samples Sample[]
+
+  @@unique([scaleId, code])
+  @@map("size_options")
+}
+
+enum PrintMethodType {
+  PRINT
+  EMBROIDERY
+  OTHER
+}
+
+model PrintMethod {
+  id                String          @id @default(uuid()) @db.Uuid
+  code              String          @unique
+  name              String
+  type              PrintMethodType @default(PRINT)
+  description       String?
+  minQuantity       Int?            @map("min_quantity")
+  maxColors         Int?            @map("max_colors")
+  supportsFullColor Boolean         @default(false) @map("supports_full_color")
+  setupFee          Decimal?        @map("setup_fee") @db.Decimal(12, 2)
+  notes             String?
+  isActive          Boolean         @default(true) @map("is_active")
+  sortOrder         Int             @default(0) @map("sort_order")
+  createdAt         DateTime        @default(now()) @map("created_at")
+  updatedAt         DateTime        @updatedAt @map("updated_at")
+  archivedAt        DateTime?       @map("archived_at")
+
+  attachments AssetAttachment[]
+  decorations SampleDecoration[]
+
+  @@index([name])
+  @@index([isActive])
+  @@map("print_methods")
+}
+
+model Accessory {
+  id          String    @id @default(uuid()) @db.Uuid
+  code        String    @unique
+  name        String
+  category    String?
+  description String?
+  unit        String?
+  isActive    Boolean   @default(true) @map("is_active")
+  sortOrder   Int       @default(0) @map("sort_order")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  archivedAt  DateTime? @map("archived_at")
+
+  sampleUses SampleAccessory[]
+
+  @@index([name])
+  @@index([isActive])
+  @@map("accessories")
+}
+
+enum ComponentCategory {
+  LABEL
+  PACKAGING
+  OTHER
+}
+
+/// One configurable table for labels and packaging items (neck label, hang tag, polybag, box, ...).
+model ComponentOption {
+  id          String            @id @default(uuid()) @db.Uuid
+  category    ComponentCategory
+  code        String            @unique
+  name        String
+  description String?
+  isActive    Boolean           @default(true) @map("is_active")
+  sortOrder   Int               @default(0) @map("sort_order")
+  createdAt   DateTime          @default(now()) @map("created_at")
+  updatedAt   DateTime          @updatedAt @map("updated_at")
+  archivedAt  DateTime?         @map("archived_at")
+
+  packagingUses OrderPackagingComponent[]
+  sampleUses    SampleComponent[]
+
+  @@index([category])
+  @@index([isActive])
+  @@map("component_options")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 — samples and the commercial workflow
+// ---------------------------------------------------------------------------
+
+enum SampleStatus {
+  DRAFT
+  SUBMITTED
+  UNDER_REVIEW
+  QUOTED
+  AWAITING_PAYMENT
+  READY_FOR_PRODUCTION
+  IN_PRODUCTION
+  AWAITING_APPROVAL
+  APPROVED
+  COMPLETED
+  ON_HOLD
+  REJECTED
+  CANCELLED
+}
+
+enum FabricProvider {
+  CUSTOMER
+  BENUE_PRINT
+  NOT_DECIDED
+}
+
+enum FitMethod {
+  BENUE_PATTERN
+  COPY_CUSTOMER_PIECE
+  CUSTOM_SIZE_CHART
+  NOT_SURE
+}
+
+enum DecorationSide {
+  FRONT
+  BACK
+  LEFT_SLEEVE
+  RIGHT_SLEEVE
+  OTHER
+}
+
+enum MeasurementUnit {
+  CM
+  MM
+  IN
+}
+
+enum PaymentState {
+  UNPAID
+  PARTIALLY_PAID
+  PAID
+}
+
+enum TransitionSource {
+  STAFF
+  SYSTEM
+  CUSTOMER
+}
+
+enum NoteVisibility {
+  INTERNAL
+  CUSTOMER_VISIBLE
+}
+
+/// A customer's request for a sample. DRAFT is freely editable; later states lock the specification.
+/// Master-data references are live pointers while the sample is being worked on; the approved
+/// state is frozen separately in SampleProductionSpec.
+model Sample {
+  id                 String        @id @default(uuid()) @db.Uuid
+  /// SMP-000001. Immutable (DB trigger).
+  sampleNumber       String        @unique @map("sample_number")
+  customerId         String        @map("customer_id") @db.Uuid
+  brandId            String        @map("brand_id") @db.Uuid
+  status             SampleStatus  @default(DRAFT)
+  /// Status to return to when an ON_HOLD sample is resumed.
+  holdPreviousStatus SampleStatus? @map("hold_previous_status")
+  /// Approved samples are never edited; a change is a new sample that points back here.
+  revisionNumber     Int           @default(1) @map("revision_number")
+  revisionOfId       String?       @map("revision_of_id") @db.Uuid
+
+  /// Configured product XOR custom product (checked by constraint and service).
+  productTypeId            String?        @map("product_type_id") @db.Uuid
+  customProductName        String?        @map("custom_product_name")
+  customProductDescription String?        @map("custom_product_description")
+  /// Configured fabric XOR custom fabric. "Other / Not Sure" is a seeded fabric row.
+  fabricId                 String?        @map("fabric_id") @db.Uuid
+  customFabricName         String?        @map("custom_fabric_name")
+  customFabricDescription  String?        @map("custom_fabric_description")
+  /// Predefined colour XOR custom colour values.
+  fabricColorId            String?        @map("fabric_color_id") @db.Uuid
+  customColorName          String?        @map("custom_color_name")
+  customPantone            String?        @map("custom_pantone")
+  customHex                String?        @map("custom_hex")
+  /// Who supplies the fabric is a property of this sample, never of the fabric master data.
+  fabricProvider           FabricProvider @default(NOT_DECIDED) @map("fabric_provider")
+  gsm                      Int?
+  sampleSizeOptionId       String?        @map("sample_size_option_id") @db.Uuid
+  fitMethod                FitMethod      @default(NOT_SURE) @map("fit_method")
+  /// A PatternVersion (never a Pattern): the exact approved fit.
+  patternVersionId         String?        @map("pattern_version_id") @db.Uuid
+
+  /// Customer-facing request notes.
+  notes               String?
+  fitNotes            String? @map("fit_notes")
+  printNotes          String? @map("print_notes")
+  fabricNotes         String? @map("fabric_notes")
+  specialInstructions String? @map("special_instructions")
+  /// Internal manufacturing instructions; never part of a customer-facing projection.
+  factoryInstructions String? @map("factory_instructions")
+
+  /// Derived from the accepted quotation and verified payments; maintained in the same
+  /// transaction as every change that affects it (stored so lists can filter on it).
+  paymentState PaymentState @default(UNPAID) @map("payment_state")
+
+  submittedAt          DateTime? @map("submitted_at")
+  reviewedAt           DateTime? @map("reviewed_at")
+  approvedAt           DateTime? @map("approved_at")
+  completedAt          DateTime? @map("completed_at")
+  createdByStaffUserId String?   @map("created_by_staff_user_id") @db.Uuid
+  /// Set when the customer created the request through the portal.
+  createdByCustomerId  String?   @map("created_by_customer_id") @db.Uuid
+  assignedSalesUserId  String?   @map("assigned_sales_user_id") @db.Uuid
+  createdAt            DateTime  @default(now()) @map("created_at")
+  updatedAt            DateTime  @updatedAt @map("updated_at")
+  archivedAt           DateTime? @map("archived_at")
+
+  customer          Customer        @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  createdByCustomer Customer?       @relation("SampleCreatedByCustomer", fields: [createdByCustomerId], references: [id], onDelete: SetNull)
+  brand             Brand           @relation(fields: [brandId], references: [id], onDelete: Restrict)
+  productType       ProductType?    @relation(fields: [productTypeId], references: [id], onDelete: Restrict)
+  fabric            Fabric?         @relation(fields: [fabricId], references: [id], onDelete: Restrict)
+  fabricColor       FabricColor?    @relation(fields: [fabricColorId], references: [id], onDelete: Restrict)
+  sampleSize        SizeOption?     @relation(fields: [sampleSizeOptionId], references: [id], onDelete: Restrict)
+  patternVersion    PatternVersion? @relation(fields: [patternVersionId], references: [id], onDelete: Restrict)
+  assignedSales     User?           @relation("SampleAssignedSales", fields: [assignedSalesUserId], references: [id], onDelete: SetNull)
+  revisionOf        Sample?         @relation("SampleRevisions", fields: [revisionOfId], references: [id], onDelete: Restrict)
+  revisions         Sample[]        @relation("SampleRevisions")
+
+  decorations      SampleDecoration[]
+  accessories      SampleAccessory[]
+  components       SampleComponent[]
+  notesList        SampleNote[]
+  statusHistory    SampleStatusHistory[]
+  termsAcceptances SampleTermsAcceptance[]
+  artworks         Artwork[]
+  quotations       Quotation[]
+  payments         Payment[]
+  approvals        Approval[]
+  productionSpecs  SampleProductionSpec[]
+  attachments      AssetAttachment[]
+  orders           Order[]
+  factoryJobs      FactoryJob[]
+
+  techPack TechPack?
+
+  @@index([customerId])
+  @@index([brandId])
+  @@index([status])
+  @@index([assignedSalesUserId])
+  @@index([productTypeId])
+  @@index([fabricId])
+  @@index([createdAt])
+  @@index([submittedAt])
+  @@index([paymentState])
+  @@index([revisionOfId])
+  @@map("samples")
+}
+
+/// Append-only timeline of every status change (also audited).
+model SampleStatusHistory {
+  id              String           @id @default(uuid()) @db.Uuid
+  sampleId        String           @map("sample_id") @db.Uuid
+  fromStatus      SampleStatus?    @map("from_status")
+  toStatus        SampleStatus     @map("to_status")
+  action          String
+  reason          String?
+  actorUserId     String?          @map("actor_user_id") @db.Uuid
+  actorCustomerId String?          @map("actor_customer_id") @db.Uuid
+  source          TransitionSource @default(STAFF)
+  createdAt       DateTime         @default(now()) @map("created_at")
+
+  sample        Sample    @relation(fields: [sampleId], references: [id], onDelete: Restrict)
+  actorCustomer Customer? @relation("HistoryActorCustomer", fields: [actorCustomerId], references: [id], onDelete: Restrict)
+
+  @@index([sampleId, createdAt])
+  @@map("sample_status_history")
+}
+
+/// Zero decoration rows means "no print".
+model SampleDecoration {
+  id              String           @id @default(uuid()) @db.Uuid
+  sampleId        String           @map("sample_id") @db.Uuid
+  printMethodId   String           @map("print_method_id") @db.Uuid
+  /// Free text: "chest", "back neck", ...
+  placement       String
+  side            DecorationSide   @default(FRONT)
+  width           Decimal?         @db.Decimal(7, 2)
+  height          Decimal?         @db.Decimal(7, 2)
+  unit            MeasurementUnit?
+  colorCount      Int?             @map("color_count")
+  notes           String?
+  artworkRequired Boolean          @default(false) @map("artwork_required")
+  artworkId       String?          @map("artwork_id") @db.Uuid
+  sortOrder       Int              @default(0) @map("sort_order")
+  createdAt       DateTime         @default(now()) @map("created_at")
+  updatedAt       DateTime         @updatedAt @map("updated_at")
+
+  sample      Sample      @relation(fields: [sampleId], references: [id], onDelete: Restrict)
+  printMethod PrintMethod @relation(fields: [printMethodId], references: [id], onDelete: Restrict)
+  artwork     Artwork?    @relation(fields: [artworkId], references: [id], onDelete: Restrict)
+
+  @@index([sampleId])
+  @@index([printMethodId])
+  @@index([artworkId])
+  @@map("sample_decorations")
+}
+
+model SampleAccessory {
+  id          String   @id @default(uuid()) @db.Uuid
+  sampleId    String   @map("sample_id") @db.Uuid
+  /// Master-data accessory XOR free-text custom accessory.
+  accessoryId String?  @map("accessory_id") @db.Uuid
+  customName  String?  @map("custom_name")
+  quantity    Int?
+  notes       String?
+  sortOrder   Int      @default(0) @map("sort_order")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  sample    Sample     @relation(fields: [sampleId], references: [id], onDelete: Restrict)
+  accessory Accessory? @relation(fields: [accessoryId], references: [id], onDelete: Restrict)
+
+  @@index([sampleId])
+  @@index([accessoryId])
+  @@map("sample_accessories")
+}
+
+/// Labels and packaging selected for a sample (ComponentOption master data or custom text).
+model SampleComponent {
+  id                String   @id @default(uuid()) @db.Uuid
+  sampleId          String   @map("sample_id") @db.Uuid
+  componentOptionId String?  @map("component_option_id") @db.Uuid
+  customName        String?  @map("custom_name")
+  notes             String?
+  sortOrder         Int      @default(0) @map("sort_order")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  sample          Sample           @relation(fields: [sampleId], references: [id], onDelete: Restrict)
+  componentOption ComponentOption? @relation(fields: [componentOptionId], references: [id], onDelete: Restrict)
+
+  @@unique([sampleId, componentOptionId])
+  @@index([sampleId])
+  @@map("sample_components")
+}
+
+model SampleNote {
+  id           String         @id @default(uuid()) @db.Uuid
+  sampleId     String         @map("sample_id") @db.Uuid
+  authorUserId String         @map("author_user_id") @db.Uuid
+  visibility   NoteVisibility @default(INTERNAL)
+  content      String
+  createdAt    DateTime       @default(now()) @map("created_at")
+  archivedAt   DateTime?      @map("archived_at")
+
+  sample Sample @relation(fields: [sampleId], references: [id], onDelete: Restrict)
+  author User   @relation(fields: [authorUserId], references: [id], onDelete: Restrict)
+
+  @@index([sampleId, createdAt])
+  @@map("sample_notes")
+}
+
+// ---- terms -----------------------------------------------------------------
+
+enum TermsAcceptanceMode {
+  STAFF_RECORDED_ON_BEHALF
+  CUSTOMER_AUTHENTICATED
+}
+
+/// Versioned legal text. Content is immutable (trigger); publish a new version instead.
+model TermsVersion {
+  id              String   @id @default(uuid()) @db.Uuid
+  code            String
+  version         Int
+  title           String
+  content         String
+  effectiveAt     DateTime @default(now()) @map("effective_at")
+  isActive        Boolean  @default(false) @map("is_active")
+  createdByUserId String?  @map("created_by_user_id") @db.Uuid
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  acceptances SampleTermsAcceptance[]
+
+  @@unique([code, version])
+  @@index([code, isActive])
+  @@map("terms_versions")
+}
+
+/// Append-only proof that a specific terms version was accepted for a sample.
+model SampleTermsAcceptance {
+  id                    String              @id @default(uuid()) @db.Uuid
+  sampleId              String              @map("sample_id") @db.Uuid
+  termsVersionId        String              @map("terms_version_id") @db.Uuid
+  mode                  TermsAcceptanceMode
+  /// The customer on whose behalf the terms were accepted (a future customer user fills this itself).
+  acceptedByCustomerId  String              @map("accepted_by_customer_id") @db.Uuid
+  recordedByStaffUserId String?             @map("recorded_by_staff_user_id") @db.Uuid
+  /// Evidence for staff-recorded acceptance (e.g. "confirmed on WhatsApp 21 Oct").
+  sourceNote            String?             @map("source_note")
+  acceptedAt            DateTime            @default(now()) @map("accepted_at")
+  ipAddress             String?             @map("ip_address")
+  userAgent             String?             @map("user_agent")
+
+  sample       Sample       @relation(fields: [sampleId], references: [id], onDelete: Restrict)
+  termsVersion TermsVersion @relation(fields: [termsVersionId], references: [id], onDelete: Restrict)
+  customer     Customer     @relation(fields: [acceptedByCustomerId], references: [id], onDelete: Restrict)
+
+  @@unique([sampleId, termsVersionId])
+  @@index([termsVersionId])
+  @@map("sample_terms_acceptances")
+}
+
+// ---- artwork ---------------------------------------------------------------
+
+enum ArtworkPurpose {
+  FRONT_PRINT
+  BACK_PRINT
+  EMBROIDERY
+  LABEL
+  PACKAGING
+  GENERAL_REFERENCE
+  OTHER
+}
+
+enum ArtworkVersionStatus {
+  DRAFT
+  APPROVED
+  SUPERSEDED
+  REJECTED
+}
+
+/// A named design owned by a brand (reusable) or by a single sample. Files live in versions.
+model Artwork {
+  id              String         @id @default(uuid()) @db.Uuid
+  /// Exactly one of brandId / sampleId is set (CHECK).
+  brandId         String?        @map("brand_id") @db.Uuid
+  sampleId        String?        @map("sample_id") @db.Uuid
+  name            String
+  purpose         ArtworkPurpose @default(GENERAL_REFERENCE)
+  createdByUserId String?        @map("created_by_user_id") @db.Uuid
+  createdAt       DateTime       @default(now()) @map("created_at")
+  updatedAt       DateTime       @updatedAt @map("updated_at")
+  archivedAt      DateTime?      @map("archived_at")
+
+  brand       Brand?             @relation(fields: [brandId], references: [id], onDelete: Restrict)
+  sample      Sample?            @relation(fields: [sampleId], references: [id], onDelete: Restrict)
+  versions    ArtworkVersion[]
+  decorations SampleDecoration[]
+
+  @@index([brandId])
+  @@index([sampleId])
+  @@map("artworks")
+}
+
+/// One uploaded file. At most one APPROVED version per artwork (partial unique index);
+/// an approved version is immutable and can only become SUPERSEDED (trigger).
+model ArtworkVersion {
+  id               String               @id @default(uuid()) @db.Uuid
+  artworkId        String               @map("artwork_id") @db.Uuid
+  versionNumber    Int                  @map("version_number")
+  status           ArtworkVersionStatus @default(DRAFT)
+  assetId          String               @map("asset_id") @db.Uuid
+  notes            String?
+  rejectionReason  String?              @map("rejection_reason")
+  createdByUserId  String?              @map("created_by_user_id") @db.Uuid
+  createdAt        DateTime             @default(now()) @map("created_at")
+  approvedAt       DateTime?            @map("approved_at")
+  approvedByUserId String?              @map("approved_by_user_id") @db.Uuid
+  rejectedAt       DateTime?            @map("rejected_at")
+  supersededAt     DateTime?            @map("superseded_at")
+
+  artwork   Artwork    @relation(fields: [artworkId], references: [id], onDelete: Restrict)
+  asset     Asset      @relation(fields: [assetId], references: [id], onDelete: Restrict)
+  approvals Approval[]
+
+  @@unique([artworkId, versionNumber])
+  @@index([assetId])
+  @@map("artwork_versions")
+}
+
+// ---- quotations --------------------------------------------------------------
+
+enum QuotationStatus {
+  DRAFT
+  SENT
+  ACCEPTED
+  REJECTED
+  EXPIRED
+  SUPERSEDED
+}
+
+enum QuotationLineType {
+  SAMPLE_FEE
+  PATTERN_FEE
+  PRINTING
+  EMBROIDERY
+  DESIGN_SERVICE
+  FABRIC
+  ACCESSORIES
+  PACKAGING
+  DISCOUNT_ADJUSTMENT
+  OTHER
+}
+
+/// The commercial offer for a sample. Content lives in immutable-once-sent versions;
+/// `status` mirrors the live (latest) version and is only changed together with it.
+model Quotation {
+  id              String          @id @default(uuid()) @db.Uuid
+  /// QTN-000001
+  quotationNumber String          @unique @map("quotation_number")
+  sampleId        String?         @map("sample_id") @db.Uuid
+  orderId         String?         @map("order_id") @db.Uuid
+  status          QuotationStatus @default(DRAFT)
+  currency        String          @default("EGP") @db.VarChar(3)
+  createdByUserId String?         @map("created_by_user_id") @db.Uuid
+  createdAt       DateTime        @default(now()) @map("created_at")
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  archivedAt      DateTime?       @map("archived_at")
+
+  sample   Sample?            @relation(fields: [sampleId], references: [id], onDelete: Restrict)
+  order    Order?             @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  versions QuotationVersion[]
+
+  @@index([sampleId])
+  @@index([orderId])
+  @@index([status])
+  @@map("quotations")
+}
+
+model QuotationVersion {
+  id                    String          @id @default(uuid()) @db.Uuid
+  quotationId           String          @map("quotation_id") @db.Uuid
+  versionNumber         Int             @map("version_number")
+  status                QuotationStatus @default(DRAFT)
+  subtotal              Decimal         @default(0) @db.Decimal(12, 2)
+  discount              Decimal         @default(0) @db.Decimal(12, 2)
+  taxPercent            Decimal         @default(0) @map("tax_percent") @db.Decimal(5, 2)
+  tax                   Decimal         @default(0) @db.Decimal(12, 2)
+  total                 Decimal         @default(0) @db.Decimal(12, 2)
+  /// Internal staff notes. Never shown to customers.
+  notes                 String?
+  /// The note printed for the customer on the quotation; the only free text of a version they see.
+  customerNotes         String?         @map("customer_notes")
+  validUntil            DateTime?       @map("valid_until")
+  createdByUserId       String?         @map("created_by_user_id") @db.Uuid
+  createdAt             DateTime        @default(now()) @map("created_at")
+  sentAt                DateTime?       @map("sent_at")
+  acceptedAt            DateTime?       @map("accepted_at")
+  rejectedAt            DateTime?       @map("rejected_at")
+  expiredAt             DateTime?       @map("expired_at")
+  supersededAt          DateTime?       @map("superseded_at")
+  /// Orders: acceptance / rejection is recorded by staff on behalf of the customer, with evidence.
+  decisionNote          String?         @map("decision_note")
+  decidedByUserId       String?         @map("decided_by_user_id") @db.Uuid
+  /// Orders: set when the customer decided in the portal (instead of staff recording it on their behalf).
+  decidedByCustomerId   String?         @map("decided_by_customer_id") @db.Uuid
+  /// Orders: the order revision this version priced (stamped at creation, immutable).
+  orderRevision         Int?            @map("order_revision")
+  /// Set once when a commercially relevant order revision made this version obsolete. The terms,
+  /// the acceptance and the decision stay untouched; only the validity ends.
+  invalidatedAt         DateTime?       @map("invalidated_at")
+  invalidatedByRevision Int?            @map("invalidated_by_revision")
+  invalidationReason    String?         @map("invalidation_reason")
+
+  quotation         Quotation           @relation(fields: [quotationId], references: [id], onDelete: Restrict)
+  decidedByCustomer Customer?           @relation("QuotationDecidedByCustomer", fields: [decidedByCustomerId], references: [id], onDelete: Restrict)
+  lineItems         QuotationLineItem[]
+  approvals         Approval[]
+  payments          Payment[]
+
+  @@unique([quotationId, versionNumber])
+  @@index([status])
+  @@map("quotation_versions")
+}
+
+model QuotationLineItem {
+  id                 String            @id @default(uuid()) @db.Uuid
+  quotationVersionId String            @map("quotation_version_id") @db.Uuid
+  type               QuotationLineType @default(OTHER)
+  description        String
+  quantity           Decimal           @db.Decimal(10, 2)
+  unitPrice          Decimal           @map("unit_price") @db.Decimal(12, 2)
+  amount             Decimal           @db.Decimal(12, 2)
+  sortOrder          Int               @default(0) @map("sort_order")
+  metadata           Json?
+
+  version QuotationVersion @relation(fields: [quotationVersionId], references: [id], onDelete: Restrict)
+
+  @@index([quotationVersionId])
+  @@map("quotation_line_items")
+}
+
+// ---- approvals ---------------------------------------------------------------
+
+enum ApprovalType {
+  QUOTATION
+  ARTWORK
+  SAMPLE
+  PRODUCTION_SPEC
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+  EXPIRED
+}
+
+enum ApprovalMode {
+  /// Reserved for the future customer portal; the API cannot record it yet.
+  CUSTOMER_AUTHENTICATED
+  STAFF_RECORDED_ON_BEHALF
+  STAFF_INTERNAL
+}
+
+/// A recorded decision on one target. Which column is set depends on `type` (CHECK).
+model Approval {
+  id                    String         @id @default(uuid()) @db.Uuid
+  type                  ApprovalType
+  sampleId              String         @map("sample_id") @db.Uuid
+  quotationVersionId    String?        @map("quotation_version_id") @db.Uuid
+  artworkVersionId      String?        @map("artwork_version_id") @db.Uuid
+  productionSpecId      String?        @map("production_spec_id") @db.Uuid
+  status                ApprovalStatus @default(PENDING)
+  mode                  ApprovalMode?
+  /// Staff member who opened the request; null when the customer opened it themselves (portal). CHECK: exactly one requester.
+  requestedByUserId     String?        @map("requested_by_user_id") @db.Uuid
+  requestedByCustomerId String?        @map("requested_by_customer_id") @db.Uuid
+  requestedAt           DateTime       @default(now()) @map("requested_at")
+  expiresAt             DateTime?      @map("expires_at")
+  respondedAt           DateTime?      @map("responded_at")
+  /// Staff member who recorded the response.
+  respondedByUserId     String?        @map("responded_by_user_id") @db.Uuid
+  /// Filled by the future customer portal for CUSTOMER_AUTHENTICATED responses.
+  respondedByCustomerId String?        @map("responded_by_customer_id") @db.Uuid
+  responseNote          String?        @map("response_note")
+  /// Evidence for approvals recorded on behalf of a customer.
+  sourceNote            String?        @map("source_note")
+  createdAt             DateTime       @default(now()) @map("created_at")
+  updatedAt             DateTime       @updatedAt @map("updated_at")
+
+  sample              Sample                @relation(fields: [sampleId], references: [id], onDelete: Restrict)
+  quotationVersion    QuotationVersion?     @relation(fields: [quotationVersionId], references: [id], onDelete: Restrict)
+  artworkVersion      ArtworkVersion?       @relation(fields: [artworkVersionId], references: [id], onDelete: Restrict)
+  productionSpec      SampleProductionSpec? @relation("ApprovalTargetSpec", fields: [productionSpecId], references: [id], onDelete: Restrict)
+  createdSpec         SampleProductionSpec? @relation("SpecCreatedByApproval")
+  requestedByCustomer Customer?             @relation("ApprovalRequestedByCustomer", fields: [requestedByCustomerId], references: [id], onDelete: Restrict)
+  respondedByCustomer Customer?             @relation("ApprovalRespondedByCustomer", fields: [respondedByCustomerId], references: [id], onDelete: Restrict)
+
+  @@index([sampleId])
+  @@index([type])
+  @@index([status])
+  @@index([quotationVersionId])
+  @@index([artworkVersionId])
+  @@map("approvals")
+}
+
+// ---- payments ----------------------------------------------------------------
+
+enum PaymentMethod {
+  INSTAPAY
+  VODAFONE_CASH
+  TELDA
+  BANK_TRANSFER
+  CASH
+  OTHER
+}
+
+enum PaymentStatus {
+  SUBMITTED
+  UNDER_REVIEW
+  VERIFIED
+  REJECTED
+  CANCELLED
+}
+
+/// A recorded payment against a sample's accepted quotation. No gateway, no card data.
+model Payment {
+  id                   String        @id @default(uuid()) @db.Uuid
+  /// PAY-000001
+  paymentNumber        String        @unique @map("payment_number")
+  sampleId             String?       @map("sample_id") @db.Uuid
+  orderId              String?       @map("order_id") @db.Uuid
+  quotationVersionId   String?       @map("quotation_version_id") @db.Uuid
+  amount               Decimal       @db.Decimal(12, 2)
+  currency             String        @db.VarChar(3)
+  method               PaymentMethod
+  status               PaymentStatus @default(SUBMITTED)
+  transactionReference String?       @map("transaction_reference")
+  proofAssetId         String?       @map("proof_asset_id") @db.Uuid
+  receivedAt           DateTime?     @map("received_at")
+  verifiedAt           DateTime?     @map("verified_at")
+  verifiedByUserId     String?       @map("verified_by_user_id") @db.Uuid
+  /// Internal finance reason. Never shown to customers; see customerMessage.
+  rejectionReason      String?       @map("rejection_reason")
+  /// The only rejection text a customer sees (explicitly written for them by staff).
+  customerMessage      String?       @map("customer_message")
+  createdByUserId      String?       @map("created_by_user_id") @db.Uuid
+  /// Set when the customer submitted the payment through the portal (instead of createdByUserId).
+  createdByCustomerId  String?       @map("created_by_customer_id") @db.Uuid
+  createdAt            DateTime      @default(now()) @map("created_at")
+  updatedAt            DateTime      @updatedAt @map("updated_at")
+
+  sample            Sample?           @relation(fields: [sampleId], references: [id], onDelete: Restrict)
+  order             Order?            @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  quotationVersion  QuotationVersion? @relation(fields: [quotationVersionId], references: [id], onDelete: Restrict)
+  proofAsset        Asset?            @relation(fields: [proofAssetId], references: [id], onDelete: Restrict)
+  createdByCustomer Customer?         @relation("PaymentCreatedByCustomer", fields: [createdByCustomerId], references: [id], onDelete: Restrict)
+
+  @@index([sampleId])
+  @@index([orderId])
+  @@index([status])
+  @@index([quotationVersionId])
+  @@index([status, verifiedAt])
+  @@map("payments")
+}
+
+// ---- production specification snapshot -----------------------------------------
+
+/// Immutable (trigger) frozen copy of everything approved for a sample. Phase 4 factory
+/// jobs read this, never the live master data. Relation ids are kept as plain columns
+/// (no cascading behaviour) next to the self-contained JSON snapshot.
+model SampleProductionSpec {
+  id                 String         @id @default(uuid()) @db.Uuid
+  sampleId           String         @map("sample_id") @db.Uuid
+  revision           Int            @default(1)
+  kind               SampleSpecKind @default(APPROVED_REFERENCE)
+  approvalId         String?        @unique @map("approval_id") @db.Uuid
+  sourceFactoryJobId String?        @map("source_factory_job_id") @db.Uuid
+  /// SHA-256 of the canonical snapshot JSON, to detect tampering.
+  specHash           String         @map("spec_hash")
+  schemaVersion      Int            @default(1) @map("schema_version")
+  snapshot           Json
+  customerId         String         @map("customer_id") @db.Uuid
+  brandId            String         @map("brand_id") @db.Uuid
+  productTypeId      String?        @map("product_type_id") @db.Uuid
+  fabricId           String?        @map("fabric_id") @db.Uuid
+  fabricColorId      String?        @map("fabric_color_id") @db.Uuid
+  patternVersionId   String?        @map("pattern_version_id") @db.Uuid
+  sampleSizeOptionId String?        @map("sample_size_option_id") @db.Uuid
+  quotationVersionId String?        @map("quotation_version_id") @db.Uuid
+  termsVersionId     String?        @map("terms_version_id") @db.Uuid
+  createdByUserId    String?        @map("created_by_user_id") @db.Uuid
+  createdAt          DateTime       @default(now()) @map("created_at")
+
+  sample           Sample                @relation(fields: [sampleId], references: [id], onDelete: Restrict)
+  approval         Approval?             @relation("SpecCreatedByApproval", fields: [approvalId], references: [id], onDelete: Restrict)
+  targetApprovals  Approval[]            @relation("ApprovalTargetSpec")
+  factoryJobs      FactoryJob[]
+  sourceFactoryJob FactoryJob?           @relation("SpecSourceJob", fields: [sourceFactoryJobId], references: [id], onDelete: Restrict)
+  orders           Order[]
+  orderItems       OrderItem[]
+  orderSpecs       OrderProductionSpec[]
+
+  techPackVersions TechPackVersion[]
+
+  @@unique([sampleId, revision])
+  @@index([sampleId, kind])
+  @@index([sourceFactoryJobId])
+  @@map("sample_production_specs")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 — factory operations
+// ---------------------------------------------------------------------------
+
+enum FactoryJobSourceType {
+  /// Manufactures the physical sample, BEFORE the customer's final approval. Uses a PRE_PRODUCTION spec.
+  SAMPLE_PRODUCTION
+  /// Reserved for Phase 5 (bulk production from an APPROVED_REFERENCE spec); nothing creates these yet.
+  BULK_ORDER
+  ORDER_BATCH
+}
+
+/// Which moment of the sample's life a frozen specification captures.
+enum SampleSpecKind {
+  /// Frozen when a SAMPLE_PRODUCTION job is created: what the factory builds the physical sample from.
+  PRE_PRODUCTION
+  /// Frozen when the customer approves the physical sample: the reference later bulk production uses.
+  APPROVED_REFERENCE
+}
+
+enum FactoryJobStatus {
+  PLANNED
+  READY
+  IN_PROGRESS
+  BLOCKED
+  ON_HOLD
+  COMPLETED
+  CANCELLED
+}
+
+enum JobPriority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+}
+
+enum DepartmentType {
+  FABRIC
+  PATTERN
+  CUTTING
+  PRINTING
+  SEWING
+  QC
+  PACKAGING
+  GENERAL
+}
+
+enum WorkflowVersionStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+}
+
+enum JobStageStatus {
+  WAITING
+  READY
+  IN_PROGRESS
+  BLOCKED
+  COMPLETED
+  SKIPPED
+  FAILED
+  CANCELLED
+}
+
+enum BlockerType {
+  WAITING_FOR_CUSTOMER
+  MATERIAL_UNAVAILABLE
+  ARTWORK_ISSUE
+  PATTERN_REVISION
+  MACHINE_MAINTENANCE
+  PAYMENT_PENDING
+  SUPPLIER_DELAY
+  QUALITY_ISSUE
+  STAFFING
+  OTHER
+}
+
+enum BlockerStatus {
+  OPEN
+  RESOLVED
+  CANCELLED
+}
+
+enum ReworkStatus {
+  OPEN
+  IN_PROGRESS
+  RESOLVED
+  CANCELLED
+}
+
+enum QcResultType {
+  PASS_FAIL
+  TEXT
+  NUMBER
+  MEASUREMENT
+  PHOTO_REQUIRED
+}
+
+enum QcItemResult {
+  PASS
+  FAIL
+  NA
+}
+
+enum QcInspectionStatus {
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum QcOverallResult {
+  PASS
+  FAIL
+  CONDITIONAL_PASS
+}
+
+enum JobNoteVisibility {
+  INTERNAL
+}
+
+enum JobActivityType {
+  JOB_CREATED
+  JOB_RELEASED
+  STAGE_READY
+  STAGE_ASSIGNED
+  STAGE_UNASSIGNED
+  STAGE_STARTED
+  STAGE_COMPLETED
+  STAGE_SKIPPED
+  STAGE_BLOCKED
+  BLOCKER_RESOLVED
+  BLOCKER_CANCELLED
+  STAGE_HELD
+  STAGE_RESUMED
+  QC_STARTED
+  QC_PASSED
+  QC_CONDITIONAL_PASS
+  QC_FAILED
+  REWORK_CREATED
+  REWORK_RESOLVED
+  JOB_HOLD
+  JOB_RESUMED
+  JOB_CANCELLED
+  JOB_COMPLETED
+  PRIORITY_CHANGED
+  NOTE_ADDED
+  ASSET_ATTACHED
+  ADMIN_OVERRIDE
+  QUANTITY_REPORTED
+}
+
+/// Work inside the factory. Its source (today a Sample) and its approved
+/// production specification are fixed at creation; detailed progress lives in JobStages.
+model FactoryJob {
+  id                        String               @id @default(uuid()) @db.Uuid
+  /// JOB-000001
+  jobNumber                 String               @unique @map("job_number")
+  sourceType                FactoryJobSourceType @default(SAMPLE_PRODUCTION) @map("source_type")
+  /// Exactly one source id is set (CHECK). Phase 5 adds order_id / order_batch_id and extends the CHECK.
+  sampleId                  String?              @map("sample_id") @db.Uuid
+  orderId                   String?              @map("order_id") @db.Uuid
+  orderBatchId              String?              @map("order_batch_id") @db.Uuid
+  orderProductionSpecId     String?              @map("order_production_spec_id") @db.Uuid
+  plannedQuantity           Int?                 @map("planned_quantity")
+  completedQuantity         Int                  @default(0) @map("completed_quantity")
+  rejectedQuantity          Int                  @default(0) @map("rejected_quantity")
+  /// The immutable approved specification this job produces. Never mutable master data.
+  sampleProductionSpecId    String               @map("sample_production_spec_id") @db.Uuid
+  workflowTemplateVersionId String               @map("workflow_template_version_id") @db.Uuid
+  status                    FactoryJobStatus     @default(READY)
+  priority                  JobPriority          @default(NORMAL)
+  assignedSalesUserId       String?              @map("assigned_sales_user_id") @db.Uuid
+  /// Copied from the frozen spec so boards can filter without reading JSON.
+  customerId                String               @map("customer_id") @db.Uuid
+  brandId                   String               @map("brand_id") @db.Uuid
+  productTypeId             String?              @map("product_type_id") @db.Uuid
+  productName               String               @map("product_name")
+  requestedStartDate        DateTime?            @map("requested_start_date")
+  targetCompletionDate      DateTime?            @map("target_completion_date")
+  startedAt                 DateTime?            @map("started_at")
+  completedAt               DateTime?            @map("completed_at")
+  cancelledAt               DateTime?            @map("cancelled_at")
+  holdReason                String?              @map("hold_reason")
+  heldAt                    DateTime?            @map("held_at")
+  holdPreviousStatus        FactoryJobStatus?    @map("hold_previous_status")
+  cancelReason              String?              @map("cancel_reason")
+  internalNotes             String?              @map("internal_notes")
+  createdByUserId           String               @map("created_by_user_id") @db.Uuid
+  createdAt                 DateTime             @default(now()) @map("created_at")
+  updatedAt                 DateTime             @updatedAt @map("updated_at")
+  archivedAt                DateTime?            @map("archived_at")
+
+  sample                  Sample?                 @relation(fields: [sampleId], references: [id], onDelete: Restrict)
+  productionSpec          SampleProductionSpec    @relation(fields: [sampleProductionSpecId], references: [id], onDelete: Restrict)
+  workflowTemplateVersion WorkflowTemplateVersion @relation(fields: [workflowTemplateVersionId], references: [id], onDelete: Restrict)
+  order                   Order?                  @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  orderBatch              OrderBatch?             @relation(fields: [orderBatchId], references: [id], onDelete: Restrict)
+  orderProductionSpec     OrderProductionSpec?    @relation(fields: [orderProductionSpecId], references: [id], onDelete: Restrict)
+  specsBuilt              SampleProductionSpec[]  @relation("SpecSourceJob")
+
+  stages      JobStage[]
+  blockers    Blocker[]
+  reworks     ReworkRecord[]
+  inspections QcInspection[]
+  activities  JobActivity[]
+  notes       JobNote[]
+  attachments AssetAttachment[]
+
+  qrTokens FactoryJobQrToken[]
+
+  @@index([priority])
+  @@index([sampleId])
+  @@index([orderId])
+  @@index([orderBatchId])
+  @@index([workflowTemplateVersionId])
+  @@index([sampleProductionSpecId])
+  @@index([createdAt])
+  @@index([targetCompletionDate])
+  @@index([customerId])
+  @@index([brandId])
+  @@index([status, targetCompletionDate])
+  @@index([completedAt])
+  @@map("factory_jobs")
+}
+
+/// Configurable catalogue of production stages (Fabric, Cutting, QC Gate 1, ...).
+model ProductionStageDefinition {
+  id                      String         @id @default(uuid()) @db.Uuid
+  code                    String         @unique
+  name                    String
+  description             String?
+  departmentType          DepartmentType @map("department_type")
+  defaultSequence         Int            @default(0) @map("default_sequence")
+  expectedDurationMinutes Int?           @map("expected_duration_minutes")
+  requiresAssignment      Boolean        @default(true) @map("requires_assignment")
+  requiresCompletionNote  Boolean        @default(false) @map("requires_completion_note")
+  requiresAttachment      Boolean        @default(false) @map("requires_attachment")
+  isQcStage               Boolean        @default(false) @map("is_qc_stage")
+  /// Role codes allowed to be assigned to this stage (roles are database rows; empty = any staff who can start stages).
+  eligibleRoleCodes       String[]       @default([]) @map("eligible_role_codes")
+  isActive                Boolean        @default(true) @map("is_active")
+  createdAt               DateTime       @default(now()) @map("created_at")
+  updatedAt               DateTime       @updatedAt @map("updated_at")
+  archivedAt              DateTime?      @map("archived_at")
+
+  templateStages  WorkflowTemplateStage[]
+  jobStages       JobStage[]
+  qcTemplates     QcTemplate[]
+  reworkTargets   ReworkRecord[]
+  slaRules        SlaRule[]
+  capacities      DepartmentCapacity[]
+  staffCapacities StaffCapacity[]
+
+  @@index([departmentType])
+  @@map("production_stage_definitions")
+}
+
+/// Identity of a workflow (e.g. BENUE_STANDARD_APPAREL). Content lives in versions.
+model WorkflowTemplate {
+  id          String    @id @default(uuid()) @db.Uuid
+  code        String    @unique
+  name        String
+  description String?
+  /// At most one default template (partial unique index).
+  isDefault   Boolean   @default(false) @map("is_default")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  archivedAt  DateTime? @map("archived_at")
+
+  versions WorkflowTemplateVersion[]
+
+  @@map("workflow_templates")
+}
+
+/// A DRAFT version can be edited; once ACTIVE its stages are frozen (trigger).
+/// Jobs pin the version they were created from.
+model WorkflowTemplateVersion {
+  id              String                @id @default(uuid()) @db.Uuid
+  templateId      String                @map("template_id") @db.Uuid
+  version         Int
+  status          WorkflowVersionStatus @default(DRAFT)
+  notes           String?
+  activatedAt     DateTime?             @map("activated_at")
+  createdByUserId String?               @map("created_by_user_id") @db.Uuid
+  createdAt       DateTime              @default(now()) @map("created_at")
+
+  template WorkflowTemplate        @relation(fields: [templateId], references: [id], onDelete: Restrict)
+  stages   WorkflowTemplateStage[]
+  jobs     FactoryJob[]
+
+  @@unique([templateId, version])
+  @@map("workflow_template_versions")
+}
+
+model WorkflowTemplateStage {
+  id                      String   @id @default(uuid()) @db.Uuid
+  versionId               String   @map("version_id") @db.Uuid
+  stageDefinitionId       String   @map("stage_definition_id") @db.Uuid
+  sequence                Int
+  isRequired              Boolean  @default(true) @map("is_required")
+  expectedDurationMinutes Int?     @map("expected_duration_minutes")
+  /// Informational today; real parallelism comes from the dependency edges.
+  canRunInParallel        Boolean  @default(false) @map("can_run_in_parallel")
+  config                  Json?
+  createdAt               DateTime @default(now()) @map("created_at")
+
+  version         WorkflowTemplateVersion           @relation(fields: [versionId], references: [id], onDelete: Restrict)
+  stageDefinition ProductionStageDefinition         @relation(fields: [stageDefinitionId], references: [id], onDelete: Restrict)
+  dependsOn       WorkflowTemplateStageDependency[] @relation("TemplateStageDependsOn")
+  dependents      WorkflowTemplateStageDependency[] @relation("TemplateStageDependents")
+  jobStages       JobStage[]
+
+  @@unique([versionId, sequence])
+  @@index([stageDefinitionId])
+  @@map("workflow_template_stages")
+}
+
+/// Explicit dependency edges (stage can start when ALL its dependencies are complete).
+model WorkflowTemplateStageDependency {
+  stageId          String @map("stage_id") @db.Uuid
+  dependsOnStageId String @map("depends_on_stage_id") @db.Uuid
+
+  stage     WorkflowTemplateStage @relation("TemplateStageDependsOn", fields: [stageId], references: [id], onDelete: Restrict)
+  dependsOn WorkflowTemplateStage @relation("TemplateStageDependents", fields: [dependsOnStageId], references: [id], onDelete: Restrict)
+
+  @@id([stageId, dependsOnStageId])
+  @@index([dependsOnStageId])
+  @@map("workflow_template_stage_dependencies")
+}
+
+/// One occurrence of a stage inside a job. Rework adds new occurrences (attempt + 1);
+/// earlier occurrences are kept as history and marked superseded.
+model JobStage {
+  id                      String          @id @default(uuid()) @db.Uuid
+  jobId                   String          @map("job_id") @db.Uuid
+  stageDefinitionId       String          @map("stage_definition_id") @db.Uuid
+  templateStageId         String?         @map("template_stage_id") @db.Uuid
+  sequence                Int
+  /// 1 for the original run; rework creates attempt 2, 3, ...
+  attempt                 Int             @default(1)
+  reworkRecordId          String?         @map("rework_record_id") @db.Uuid
+  status                  JobStageStatus  @default(WAITING)
+  // Snapshot of the definition at job creation, so later catalogue edits never change a running job.
+  stageCode               String          @map("stage_code")
+  stageName               String          @map("stage_name")
+  departmentType          DepartmentType  @map("department_type")
+  isRequired              Boolean         @default(true) @map("is_required")
+  isQcStage               Boolean         @default(false) @map("is_qc_stage")
+  requiresAssignment      Boolean         @default(true) @map("requires_assignment")
+  requiresCompletionNote  Boolean         @default(false) @map("requires_completion_note")
+  requiresAttachment      Boolean         @default(false) @map("requires_attachment")
+  expectedDurationMinutes Int?            @map("expected_duration_minutes")
+  readyAt                 DateTime?       @map("ready_at")
+  dueAt                   DateTime?       @map("due_at")
+  startedAt               DateTime?       @map("started_at")
+  completedAt             DateTime?       @map("completed_at")
+  blockedAt               DateTime?       @map("blocked_at")
+  blockReason             String?         @map("block_reason")
+  /// Status to return to when the last open blocker is resolved.
+  blockedFromStatus       JobStageStatus? @map("blocked_from_status")
+  /// Hold pauses work without losing the stage's state.
+  isOnHold                Boolean         @default(false) @map("is_on_hold")
+  holdReason              String?         @map("hold_reason")
+  heldAt                  DateTime?       @map("held_at")
+  completionNote          String?         @map("completion_note")
+  /// Set when a newer occurrence replaced this one (failed QC / reworked stage).
+  supersededAt            DateTime?       @map("superseded_at")
+  createdAt               DateTime        @default(now()) @map("created_at")
+  updatedAt               DateTime        @updatedAt @map("updated_at")
+
+  job             FactoryJob                @relation(fields: [jobId], references: [id], onDelete: Restrict)
+  stageDefinition ProductionStageDefinition @relation(fields: [stageDefinitionId], references: [id], onDelete: Restrict)
+  templateStage   WorkflowTemplateStage?    @relation(fields: [templateStageId], references: [id], onDelete: Restrict)
+  rework          ReworkRecord?             @relation("ReworkStages", fields: [reworkRecordId], references: [id], onDelete: Restrict)
+
+  dependsOn        JobStageDependency[]    @relation("JobStageDependsOn")
+  dependents       JobStageDependency[]    @relation("JobStageDependents")
+  assignments      StageAssignment[]
+  blockers         Blocker[]
+  inspections      QcInspection[]
+  activities       JobActivity[]
+  notes            JobNote[]
+  attachments      AssetAttachment[]
+  failedFor        ReworkRecord[]          @relation("ReworkFailedStage")
+  packagingReports PackagingReport[]
+  reports          StageProductionReport[]
+
+  @@unique([jobId, sequence, attempt])
+  @@index([jobId])
+  @@index([stageDefinitionId])
+  @@index([dueAt])
+  @@index([status, dueAt])
+  @@index([stageDefinitionId, status])
+  @@index([completedAt])
+  @@map("job_stages")
+}
+
+model JobStageDependency {
+  jobStageId          String @map("job_stage_id") @db.Uuid
+  dependsOnJobStageId String @map("depends_on_job_stage_id") @db.Uuid
+
+  jobStage  JobStage @relation("JobStageDependsOn", fields: [jobStageId], references: [id], onDelete: Restrict)
+  dependsOn JobStage @relation("JobStageDependents", fields: [dependsOnJobStageId], references: [id], onDelete: Restrict)
+
+  @@id([jobStageId, dependsOnJobStageId])
+  @@index([dependsOnJobStageId])
+  @@map("job_stage_dependencies")
+}
+
+enum StageAssignmentSource {
+  MANUAL
+  GLOBAL_DEFAULT
+  CUSTOMER_OVERRIDE
+}
+
+enum ResponsibilityScope {
+  GLOBAL
+  CUSTOMER
+}
+
+/// Who works a stage (several people allowed). Removal keeps the row (history).
+model StageAssignment {
+  id               String                @id @default(uuid()) @db.Uuid
+  jobStageId       String                @map("job_stage_id") @db.Uuid
+  userId           String                @map("user_id") @db.Uuid
+  assignedByUserId String?               @map("assigned_by_user_id") @db.Uuid
+  assignedAt       DateTime              @default(now()) @map("assigned_at")
+  isPrimary        Boolean               @default(false) @map("is_primary")
+  context          String?
+  /// Why this person owns the stage: a manual assignment, or an automatic one from a responsibility rule.
+  source           StageAssignmentSource @default(MANUAL)
+  removedAt        DateTime?             @map("removed_at")
+  removedByUserId  String?               @map("removed_by_user_id") @db.Uuid
+
+  jobStage JobStage @relation(fields: [jobStageId], references: [id], onDelete: Restrict)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([userId])
+  @@index([jobStageId])
+  @@index([removedAt])
+  @@map("stage_assignments")
+}
+
+model Blocker {
+  id               String        @id @default(uuid()) @db.Uuid
+  jobId            String        @map("job_id") @db.Uuid
+  /// null = the whole job is blocked
+  jobStageId       String?       @map("job_stage_id") @db.Uuid
+  type             BlockerType
+  description      String
+  status           BlockerStatus @default(OPEN)
+  createdByUserId  String        @map("created_by_user_id") @db.Uuid
+  resolvedByUserId String?       @map("resolved_by_user_id") @db.Uuid
+  resolutionNote   String?       @map("resolution_note")
+  createdAt        DateTime      @default(now()) @map("created_at")
+  resolvedAt       DateTime?     @map("resolved_at")
+  cancelledAt      DateTime?     @map("cancelled_at")
+
+  job      FactoryJob @relation(fields: [jobId], references: [id], onDelete: Restrict)
+  jobStage JobStage?  @relation(fields: [jobStageId], references: [id], onDelete: Restrict)
+
+  @@index([jobId])
+  @@index([jobStageId])
+  @@index([status, type])
+  @@map("blockers")
+}
+
+/// A failed gate sends work back without rewriting history: the failed stage keeps its
+/// row, a new occurrence of the target stage (and of the QC re-check) is created.
+model ReworkRecord {
+  id                      String       @id @default(uuid()) @db.Uuid
+  jobId                   String       @map("job_id") @db.Uuid
+  failedStageId           String       @unique @map("failed_stage_id") @db.Uuid
+  qcInspectionId          String?      @unique @map("qc_inspection_id") @db.Uuid
+  targetStageDefinitionId String       @map("target_stage_definition_id") @db.Uuid
+  reason                  String
+  affectedQuantity        Int?         @map("affected_quantity")
+  status                  ReworkStatus @default(OPEN)
+  createdByUserId         String       @map("created_by_user_id") @db.Uuid
+  createdAt               DateTime     @default(now()) @map("created_at")
+  resolvedAt              DateTime?    @map("resolved_at")
+  cancelledAt             DateTime?    @map("cancelled_at")
+
+  job              FactoryJob                @relation(fields: [jobId], references: [id], onDelete: Restrict)
+  failedStage      JobStage                  @relation("ReworkFailedStage", fields: [failedStageId], references: [id], onDelete: Restrict)
+  inspection       QcInspection?             @relation("InspectionRework", fields: [qcInspectionId], references: [id], onDelete: Restrict)
+  targetDefinition ProductionStageDefinition @relation(fields: [targetStageDefinitionId], references: [id], onDelete: Restrict)
+  stages           JobStage[]                @relation("ReworkStages")
+
+  @@index([jobId])
+  @@index([status])
+  @@index([createdAt])
+  @@map("rework_records")
+}
+
+/// Versioned checklist for a QC stage definition. Items are immutable (trigger); publish a new version to change them.
+model QcTemplate {
+  id                String   @id @default(uuid()) @db.Uuid
+  code              String
+  name              String
+  description       String?
+  stageDefinitionId String   @map("stage_definition_id") @db.Uuid
+  version           Int      @default(1)
+  isActive          Boolean  @default(true) @map("is_active")
+  createdByUserId   String?  @map("created_by_user_id") @db.Uuid
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  stageDefinition ProductionStageDefinition   @relation(fields: [stageDefinitionId], references: [id], onDelete: Restrict)
+  items           QcChecklistItemDefinition[]
+  inspections     QcInspection[]
+
+  @@unique([code, version])
+  @@index([stageDefinitionId, isActive])
+  @@map("qc_templates")
+}
+
+model QcChecklistItemDefinition {
+  id           String       @id @default(uuid()) @db.Uuid
+  qcTemplateId String       @map("qc_template_id") @db.Uuid
+  code         String
+  label        String
+  description  String?
+  resultType   QcResultType @map("result_type")
+  required     Boolean      @default(true)
+  sortOrder    Int          @default(0) @map("sort_order")
+  /// e.g. { "unit": "cm", "target": 25, "tolerance": 0.5 } for MEASUREMENT items
+  config       Json?
+
+  template QcTemplate           @relation(fields: [qcTemplateId], references: [id], onDelete: Restrict)
+  results  QcInspectionResult[]
+
+  @@unique([qcTemplateId, code])
+  @@map("qc_checklist_item_definitions")
+}
+
+model QcInspection {
+  id                String             @id @default(uuid()) @db.Uuid
+  jobId             String             @map("job_id") @db.Uuid
+  jobStageId        String             @map("job_stage_id") @db.Uuid
+  qcTemplateId      String             @map("qc_template_id") @db.Uuid
+  templateVersion   Int                @map("template_version")
+  inspectorUserId   String             @map("inspector_user_id") @db.Uuid
+  status            QcInspectionStatus @default(IN_PROGRESS)
+  overallResult     QcOverallResult?   @map("overall_result")
+  notes             String?
+  inspectedQuantity Int?               @map("inspected_quantity")
+  passedQuantity    Int?               @map("passed_quantity")
+  failedQuantity    Int?               @map("failed_quantity")
+  startedAt         DateTime           @default(now()) @map("started_at")
+  completedAt       DateTime?          @map("completed_at")
+
+  job         FactoryJob           @relation(fields: [jobId], references: [id], onDelete: Restrict)
+  jobStage    JobStage             @relation(fields: [jobStageId], references: [id], onDelete: Restrict)
+  template    QcTemplate           @relation(fields: [qcTemplateId], references: [id], onDelete: Restrict)
+  inspector   User                 @relation(fields: [inspectorUserId], references: [id], onDelete: Restrict)
+  results     QcInspectionResult[]
+  rework      ReworkRecord?        @relation("InspectionRework")
+  attachments AssetAttachment[]
+
+  @@index([jobId])
+  @@index([jobStageId])
+  @@index([status])
+  @@index([inspectorUserId])
+  @@index([completedAt])
+  @@index([overallResult, completedAt])
+  @@map("qc_inspections")
+}
+
+model QcInspectionResult {
+  id              String        @id @default(uuid()) @db.Uuid
+  inspectionId    String        @map("inspection_id") @db.Uuid
+  checklistItemId String        @map("checklist_item_id") @db.Uuid
+  result          QcItemResult?
+  numericValue    Decimal?      @map("numeric_value") @db.Decimal(14, 4)
+  textValue       String?       @map("text_value")
+  notes           String?
+  createdAt       DateTime      @default(now()) @map("created_at")
+  updatedAt       DateTime      @updatedAt @map("updated_at")
+
+  inspection QcInspection              @relation(fields: [inspectionId], references: [id], onDelete: Restrict)
+  item       QcChecklistItemDefinition @relation(fields: [checklistItemId], references: [id], onDelete: Restrict)
+
+  @@unique([inspectionId, checklistItemId])
+  @@map("qc_inspection_results")
+}
+
+/// Operational timeline (what happened on the shop floor). Distinct from the security AuditLog.
+model JobActivity {
+  id          String          @id @default(uuid()) @db.Uuid
+  jobId       String          @map("job_id") @db.Uuid
+  jobStageId  String?         @map("job_stage_id") @db.Uuid
+  actorUserId String?         @map("actor_user_id") @db.Uuid
+  type        JobActivityType
+  message     String
+  metadata    Json?
+  createdAt   DateTime        @default(now()) @map("created_at")
+
+  job      FactoryJob @relation(fields: [jobId], references: [id], onDelete: Restrict)
+  jobStage JobStage?  @relation(fields: [jobStageId], references: [id], onDelete: Restrict)
+  actor    User?      @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([jobId, createdAt])
+  @@index([jobStageId])
+  @@map("job_activities")
+}
+
+model JobNote {
+  id           String            @id @default(uuid()) @db.Uuid
+  jobId        String            @map("job_id") @db.Uuid
+  jobStageId   String?           @map("job_stage_id") @db.Uuid
+  authorUserId String            @map("author_user_id") @db.Uuid
+  visibility   JobNoteVisibility @default(INTERNAL)
+  content      String
+  createdAt    DateTime          @default(now()) @map("created_at")
+  archivedAt   DateTime?         @map("archived_at")
+
+  job      FactoryJob @relation(fields: [jobId], references: [id], onDelete: Restrict)
+  jobStage JobStage?  @relation(fields: [jobStageId], references: [id], onDelete: Restrict)
+  author   User       @relation(fields: [authorUserId], references: [id], onDelete: Restrict)
+
+  @@index([jobId, createdAt])
+  @@index([jobStageId])
+  @@map("job_notes")
+}
+
+// ───────────────────────── Phase 5A: bulk orders and production control ─────────────────────────
+
+enum OrderStatus {
+  DRAFT
+  PENDING_CONFIRMATION
+  CONFIRMED
+  READY_FOR_PRODUCTION
+  IN_PRODUCTION
+  PARTIALLY_COMPLETED
+  PRODUCTION_COMPLETED
+  READY_FOR_PACKAGING
+  PACKAGING
+  READY_FOR_DELIVERY
+  PARTIALLY_SHIPPED
+  OUT_FOR_DELIVERY
+  DELIVERED
+  COMPLETED
+  ON_HOLD
+  CANCELLED
+}
+
+enum OrderBatchStatus {
+  PLANNED
+  READY
+  IN_PRODUCTION
+  PARTIALLY_COMPLETED
+  COMPLETED
+  ON_HOLD
+  CANCELLED
+}
+
+enum OrderActivityType {
+  ORDER_CREATED
+  ORDER_UPDATED
+  ORDER_SUBMITTED
+  ORDER_CONFIRMED
+  ORDER_REVISED
+  PRODUCTION_READY
+  PRODUCTION_STARTED
+  BATCH_CREATED
+  BATCH_UPDATED
+  BATCH_STARTED
+  PRODUCTION_COMPLETED
+  ORDER_HELD
+  ORDER_RESUMED
+  ORDER_CANCELLED
+  PRIORITY_CHANGED
+  JOB_CREATED
+  REORDER_CREATED
+  PACKAGING_STARTED
+  PACKAGING_COMPLETED
+  SHIPMENT_CREATED
+  SHIPMENT_READY
+  SHIPMENT_DISPATCHED
+  SHIPMENT_FAILED
+  SHIPMENT_RETURNED
+  SHIPMENT_DELIVERED
+  ORDER_DELIVERED
+  ORDER_COMPLETED
+  QUOTATION_SENT
+  QUOTATION_ACCEPTED
+  PAYMENT_VERIFIED
+  TRACKING_UPDATED
+  COMMERCIAL_REAPPROVAL_REQUIRED
+}
+
+/// A bulk production order. It always produces the APPROVED_REFERENCE of an approved sample.
+model Order {
+  id                       String       @id @default(uuid()) @db.Uuid
+  /// ORD-000001
+  orderNumber              String       @unique @map("order_number")
+  customerId               String       @map("customer_id") @db.Uuid
+  brandId                  String       @map("brand_id") @db.Uuid
+  sourceSampleId           String       @map("source_sample_id") @db.Uuid
+  /// Must be an APPROVED_REFERENCE (trigger). Never the pre-production spec.
+  approvedProductionSpecId String       @map("approved_production_spec_id") @db.Uuid
+  reorderOfOrderId         String?      @map("reorder_of_order_id") @db.Uuid
+  status                   OrderStatus  @default(DRAFT)
+  priority                 JobPriority  @default(NORMAL)
+  /// Increases with every controlled revision after confirmation.
+  revisionNumber           Int          @default(0) @map("revision_number")
+  /// Revision that last changed commercially relevant data; quotations accepted before it no longer apply.
+  commercialRevision       Int          @default(0) @map("commercial_revision")
+  /// The frozen order specification currently in force (set at confirmation).
+  currentSpecId            String?      @map("current_spec_id") @db.Uuid
+  targetDeliveryDate       DateTime?    @map("target_delivery_date")
+  confirmedAt              DateTime?    @map("confirmed_at")
+  productionStartDate      DateTime?    @map("production_start_date")
+  completedAt              DateTime?    @map("completed_at")
+  /// All deliverable units delivered (derived), and the explicit close of the order.
+  deliveredAt              DateTime?    @map("delivered_at")
+  closedAt                 DateTime?    @map("closed_at")
+  cancelledAt              DateTime?    @map("cancelled_at")
+  cancellationReason       String?      @map("cancellation_reason")
+  holdReason               String?      @map("hold_reason")
+  heldAt                   DateTime?    @map("held_at")
+  holdPreviousStatus       OrderStatus? @map("hold_previous_status")
+  assignedSalesUserId      String?      @map("assigned_sales_user_id") @db.Uuid
+  internalNotes            String?      @map("internal_notes")
+  /// Written by the customer (portal); visible to both sides. Never mixed into internalNotes.
+  customerNotes            String?      @map("customer_notes")
+  /// Staff member who created it; null when the customer placed it through the portal (CHECK: exactly one creator).
+  createdByUserId          String?      @map("created_by_user_id") @db.Uuid
+  createdByCustomerId      String?      @map("created_by_customer_id") @db.Uuid
+  /// The customer's preferred delivery address (a hint for staff; shipments snapshot their own destination).
+  preferredAddressId       String?      @map("preferred_address_id") @db.Uuid
+  createdAt                DateTime     @default(now()) @map("created_at")
+  updatedAt                DateTime     @updatedAt @map("updated_at")
+  archivedAt               DateTime?    @map("archived_at")
+
+  createdByCustomer Customer?             @relation("OrderCreatedByCustomer", fields: [createdByCustomerId], references: [id], onDelete: Restrict)
+  preferredAddress  CustomerAddress?      @relation("OrderPreferredAddress", fields: [preferredAddressId], references: [id], onDelete: SetNull)
+  customer          Customer              @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  brand             Brand                 @relation(fields: [brandId], references: [id], onDelete: Restrict)
+  sourceSample      Sample                @relation(fields: [sourceSampleId], references: [id], onDelete: Restrict)
+  approvedSpec      SampleProductionSpec  @relation(fields: [approvedProductionSpecId], references: [id], onDelete: Restrict)
+  reorderOf         Order?                @relation("Reorders", fields: [reorderOfOrderId], references: [id], onDelete: Restrict)
+  reorders          Order[]               @relation("Reorders")
+  paymentState      PaymentState          @default(UNPAID) @map("payment_state")
+  quotations        Quotation[]
+  payments          Payment[]
+  packagingSpec     OrderPackagingSpec?
+  shipments         Shipment[]
+  trackingTokens    OrderTrackingToken[]
+  items             OrderItem[]
+  specs             OrderProductionSpec[]
+  revisions         OrderRevision[]
+  batches           OrderBatch[]
+  jobs              FactoryJob[]
+  activities        OrderActivity[]
+
+  techPack TechPack?
+
+  @@index([customerId])
+  @@index([brandId])
+  @@index([sourceSampleId])
+  @@index([priority])
+  @@index([assignedSalesUserId])
+  @@index([targetDeliveryDate])
+  @@index([createdAt])
+  @@index([reorderOfOrderId])
+  @@index([status, targetDeliveryDate])
+  @@index([deliveredAt])
+  @@map("orders")
+}
+
+model OrderItem {
+  id                       String   @id @default(uuid()) @db.Uuid
+  orderId                  String   @map("order_id") @db.Uuid
+  /// Same approved reference as the order (trigger). Future multi-product orders keep one per item.
+  approvedProductionSpecId String   @map("approved_production_spec_id") @db.Uuid
+  productNameSnapshot      String   @map("product_name_snapshot")
+  productTypeId            String?  @map("product_type_id") @db.Uuid
+  quantity                 Int
+  notes                    String?
+  sortOrder                Int      @default(0) @map("sort_order")
+  createdAt                DateTime @default(now()) @map("created_at")
+  updatedAt                DateTime @updatedAt @map("updated_at")
+
+  order        Order                @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  approvedSpec SampleProductionSpec @relation(fields: [approvedProductionSpecId], references: [id], onDelete: Restrict)
+  variants     OrderVariant[]
+
+  @@index([orderId])
+  @@map("order_items")
+}
+
+model OrderVariant {
+  id                String   @id @default(uuid()) @db.Uuid
+  orderItemId       String   @map("order_item_id") @db.Uuid
+  sizeOptionId      String?  @map("size_option_id") @db.Uuid
+  customSizeName    String?  @map("custom_size_name")
+  fabricColorId     String?  @map("fabric_color_id") @db.Uuid
+  customColorName   String?  @map("custom_color_name")
+  pantone           String?
+  hex               String?
+  quantity          Int
+  /// Updated from final-stage production reports that name this variant.
+  completedQuantity Int      @default(0) @map("completed_quantity")
+  rejectedQuantity  Int      @default(0) @map("rejected_quantity")
+  notes             String?
+  sortOrder         Int      @default(0) @map("sort_order")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  item          OrderItem               @relation(fields: [orderItemId], references: [id], onDelete: Restrict)
+  shipmentLines ShipmentLine[]
+  allocations   OrderBatchVariant[]
+  reports       StageProductionReport[]
+
+  @@index([orderItemId])
+  @@index([sizeOptionId])
+  @@index([fabricColorId])
+  @@map("order_variants")
+}
+
+/// What an order commits the factory to: approved baseline + order-specific choices. Frozen at confirmation; append-only.
+model OrderProductionSpec {
+  id                       String   @id @default(uuid()) @db.Uuid
+  orderId                  String   @map("order_id") @db.Uuid
+  revision                 Int
+  approvedProductionSpecId String   @map("approved_production_spec_id") @db.Uuid
+  totalQuantity            Int      @map("total_quantity")
+  specHash                 String   @map("spec_hash")
+  snapshot                 Json
+  createdByUserId          String   @map("created_by_user_id") @db.Uuid
+  createdAt                DateTime @default(now()) @map("created_at")
+
+  order        Order                @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  approvedSpec SampleProductionSpec @relation(fields: [approvedProductionSpecId], references: [id], onDelete: Restrict)
+  jobs         FactoryJob[]
+  revisionRow  OrderRevision?
+
+  techPackVersions TechPackVersion[]
+
+  @@unique([orderId, revision])
+  @@map("order_production_specs")
+}
+
+/// Controlled change of a confirmed order; the previous items/variants are kept in `previousSnapshot`.
+model OrderRevision {
+  id                String   @id @default(uuid()) @db.Uuid
+  orderId           String   @map("order_id") @db.Uuid
+  revisionNumber    Int      @map("revision_number")
+  reason            String
+  previousSnapshot  Json     @map("previous_snapshot")
+  /// Whether the revision changed commercially relevant data, and what (see order-revision-impact.ts).
+  commercialImpact  Boolean  @default(false) @map("commercial_impact")
+  commercialChanges Json?    @map("commercial_changes")
+  specId            String   @unique @map("spec_id") @db.Uuid
+  createdByUserId   String   @map("created_by_user_id") @db.Uuid
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  order Order               @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  spec  OrderProductionSpec @relation(fields: [specId], references: [id], onDelete: Restrict)
+
+  @@unique([orderId, revisionNumber])
+  @@map("order_revisions")
+}
+
+model OrderBatch {
+  id                   String            @id @default(uuid()) @db.Uuid
+  /// BAT-000001
+  batchNumber          String            @unique @map("batch_number")
+  orderId              String            @map("order_id") @db.Uuid
+  status               OrderBatchStatus  @default(PLANNED)
+  /// Always the sum of its allocations.
+  quantity             Int               @default(0)
+  targetStartDate      DateTime?         @map("target_start_date")
+  targetCompletionDate DateTime?         @map("target_completion_date")
+  startedAt            DateTime?         @map("started_at")
+  completedAt          DateTime?         @map("completed_at")
+  holdReason           String?           @map("hold_reason")
+  holdPreviousStatus   OrderBatchStatus? @map("hold_previous_status")
+  cancelReason         String?           @map("cancel_reason")
+  cancelledAt          DateTime?         @map("cancelled_at")
+  createdByUserId      String            @map("created_by_user_id") @db.Uuid
+  createdAt            DateTime          @default(now()) @map("created_at")
+  updatedAt            DateTime          @updatedAt @map("updated_at")
+
+  order       Order               @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  allocations OrderBatchVariant[]
+  jobs        FactoryJob[]
+
+  @@index([orderId])
+  @@index([status])
+  @@map("order_batches")
+}
+
+model OrderBatchVariant {
+  id             String   @id @default(uuid()) @db.Uuid
+  batchId        String   @map("batch_id") @db.Uuid
+  orderVariantId String   @map("order_variant_id") @db.Uuid
+  quantity       Int
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  batch   OrderBatch   @relation(fields: [batchId], references: [id], onDelete: Restrict)
+  variant OrderVariant @relation(fields: [orderVariantId], references: [id], onDelete: Restrict)
+
+  @@unique([batchId, orderVariantId])
+  @@index([orderVariantId])
+  @@map("order_batch_variants")
+}
+
+/// Operational timeline of an order (separate from the security AuditLog and from JobActivity).
+model OrderActivity {
+  id              String            @id @default(uuid()) @db.Uuid
+  orderId         String            @map("order_id") @db.Uuid
+  actorUserId     String?           @map("actor_user_id") @db.Uuid
+  /// Set instead of actorUserId when the customer caused the entry (portal).
+  actorCustomerId String?           @map("actor_customer_id") @db.Uuid
+  type            OrderActivityType
+  message         String
+  metadata        Json?
+  createdAt       DateTime          @default(now()) @map("created_at")
+
+  order         Order     @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  actorCustomer Customer? @relation("OrderActivityActorCustomer", fields: [actorCustomerId], references: [id], onDelete: Restrict)
+
+  @@index([orderId, createdAt])
+  @@map("order_activities")
+}
+
+/// Append-only quantity report for one stage occurrence.
+model StageProductionReport {
+  id               String   @id @default(uuid()) @db.Uuid
+  jobStageId       String   @map("job_stage_id") @db.Uuid
+  producedQuantity Int      @default(0) @map("produced_quantity")
+  rejectedQuantity Int      @default(0) @map("rejected_quantity")
+  /// Units flagged as needing rework (informational; formal rework is created through QC or by an admin).
+  reworkQuantity   Int      @default(0) @map("rework_quantity")
+  orderVariantId   String?  @map("order_variant_id") @db.Uuid
+  notes            String?
+  reportedByUserId String   @map("reported_by_user_id") @db.Uuid
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  packagingReport PackagingReport?
+  jobStage        JobStage         @relation(fields: [jobStageId], references: [id], onDelete: Restrict)
+  variant         OrderVariant?    @relation(fields: [orderVariantId], references: [id], onDelete: Restrict)
+
+  @@index([jobStageId])
+  @@index([orderVariantId])
+  @@index([createdAt])
+  @@index([reportedByUserId, createdAt])
+  @@map("stage_production_reports")
+}
+
+// ───────────────────────── Phase 5B: packaging, delivery and tracking ─────────────────────────
+
+enum ShipmentStatus {
+  DRAFT
+  READY
+  DISPATCHED
+  IN_TRANSIT
+  DELIVERED
+  FAILED
+  RETURNED
+  CANCELLED
+}
+
+enum DeliveryMethod {
+  OWN_DELIVERY
+  COURIER
+  CUSTOMER_PICKUP
+}
+
+/// How an order is packed. Editable until packaging work starts.
+model OrderPackagingSpec {
+  id                  String   @id @default(uuid()) @db.Uuid
+  orderId             String   @unique @map("order_id") @db.Uuid
+  foldingInstructions String?  @map("folding_instructions")
+  polybagRequired     Boolean  @default(false) @map("polybag_required")
+  labelsRequired      Boolean  @default(false) @map("labels_required")
+  hangTagsRequired    Boolean  @default(false) @map("hang_tags_required")
+  stickersRequired    Boolean  @default(false) @map("stickers_required")
+  stickerNotes        String?  @map("sticker_notes")
+  unitsPerCarton      Int?     @map("units_per_carton")
+  cartonNotes         String?  @map("carton_notes")
+  specialInstructions String?  @map("special_instructions")
+  updatedByUserId     String   @map("updated_by_user_id") @db.Uuid
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+
+  order      Order                     @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  components OrderPackagingComponent[]
+
+  @@map("order_packaging_specs")
+}
+
+/// A packaging component: a master-data option or a free-text custom one.
+model OrderPackagingComponent {
+  id                String   @id @default(uuid()) @db.Uuid
+  packagingSpecId   String   @map("packaging_spec_id") @db.Uuid
+  componentOptionId String?  @map("component_option_id") @db.Uuid
+  customName        String?  @map("custom_name")
+  quantityPerUnit   Int?     @map("quantity_per_unit")
+  notes             String?
+  sortOrder         Int      @default(0) @map("sort_order")
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  spec            OrderPackagingSpec @relation(fields: [packagingSpecId], references: [id], onDelete: Cascade)
+  componentOption ComponentOption?   @relation(fields: [componentOptionId], references: [id], onDelete: Restrict)
+
+  @@index([packagingSpecId])
+  @@index([componentOptionId])
+  @@map("order_packaging_components")
+}
+
+/// Append-only packaging execution report; each one is backed by a stage production report.
+model PackagingReport {
+  id               String   @id @default(uuid()) @db.Uuid
+  jobStageId       String   @map("job_stage_id") @db.Uuid
+  stageReportId    String   @unique @map("stage_report_id") @db.Uuid
+  packedQuantity   Int      @map("packed_quantity")
+  damagedQuantity  Int      @default(0) @map("damaged_quantity")
+  cartonCount      Int      @default(0) @map("carton_count")
+  notes            String?
+  reportedByUserId String   @map("reported_by_user_id") @db.Uuid
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  jobStage    JobStage              @relation(fields: [jobStageId], references: [id], onDelete: Restrict)
+  stageReport StageProductionReport @relation(fields: [stageReportId], references: [id], onDelete: Restrict)
+
+  @@index([jobStageId])
+  @@map("packaging_reports")
+}
+
+model Shipment {
+  id                     String         @id @default(uuid()) @db.Uuid
+  /// SHP-000001
+  shipmentNumber         String         @unique @map("shipment_number")
+  orderId                String         @map("order_id") @db.Uuid
+  status                 ShipmentStatus @default(DRAFT)
+  deliveryMethod         DeliveryMethod @map("delivery_method")
+  recipientName          String         @map("recipient_name")
+  recipientPhone         String         @map("recipient_phone")
+  /// Immutable copy of the destination at creation; later edits of the customer's address never touch it.
+  addressSnapshot        Json           @map("address_snapshot")
+  customerAddressId      String?        @map("customer_address_id") @db.Uuid
+  courierName            String?        @map("courier_name")
+  trackingNumber         String?        @map("tracking_number")
+  trackingUrl            String?        @map("tracking_url")
+  scheduledAt            DateTime?      @map("scheduled_at")
+  readyAt                DateTime?      @map("ready_at")
+  dispatchedAt           DateTime?      @map("dispatched_at")
+  inTransitAt            DateTime?      @map("in_transit_at")
+  deliveredAt            DateTime?      @map("delivered_at")
+  failedAt               DateTime?      @map("failed_at")
+  returnedAt             DateTime?      @map("returned_at")
+  cancelledAt            DateTime?      @map("cancelled_at")
+  failureReason          String?        @map("failure_reason")
+  returnReason           String?        @map("return_reason")
+  cancelReason           String?        @map("cancel_reason")
+  proofAssetId           String?        @map("proof_asset_id") @db.Uuid
+  notes                  String?
+  deliveryNotes          String?        @map("delivery_notes")
+  assignedDeliveryUserId String?        @map("assigned_delivery_user_id") @db.Uuid
+  createdByUserId        String         @map("created_by_user_id") @db.Uuid
+  createdAt              DateTime       @default(now()) @map("created_at")
+  updatedAt              DateTime       @updatedAt @map("updated_at")
+
+  order      Order          @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  proofAsset Asset?         @relation(fields: [proofAssetId], references: [id], onDelete: Restrict)
+  lines      ShipmentLine[]
+
+  @@index([orderId])
+  @@index([assignedDeliveryUserId])
+  @@index([trackingNumber])
+  @@index([createdAt])
+  @@index([status, scheduledAt])
+  @@index([deliveredAt])
+  @@map("shipments")
+}
+
+model ShipmentLine {
+  id             String   @id @default(uuid()) @db.Uuid
+  shipmentId     String   @map("shipment_id") @db.Uuid
+  orderVariantId String   @map("order_variant_id") @db.Uuid
+  quantity       Int
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  shipment Shipment     @relation(fields: [shipmentId], references: [id], onDelete: Restrict)
+  variant  OrderVariant @relation(fields: [orderVariantId], references: [id], onDelete: Restrict)
+
+  @@unique([shipmentId, orderVariantId])
+  @@index([shipmentId])
+  @@index([orderVariantId])
+  @@map("shipment_lines")
+}
+
+/// Customer-safe tracking link. Only the SHA-256 of the token is stored; the token is shown once.
+model OrderTrackingToken {
+  id              String    @id @default(uuid()) @db.Uuid
+  orderId         String    @map("order_id") @db.Uuid
+  tokenHash       String    @unique @map("token_hash")
+  expiresAt       DateTime? @map("expires_at")
+  revokedAt       DateTime? @map("revoked_at")
+  lastUsedAt      DateTime? @map("last_used_at")
+  createdByUserId String    @map("created_by_user_id") @db.Uuid
+  createdAt       DateTime  @default(now()) @map("created_at")
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Restrict)
+
+  @@index([orderId])
+  @@map("order_tracking_tokens")
+}
+
+// ───────────────────────── Phase 6A: management intelligence (configuration only) ─────────────────────────
+
+enum SlaTargetType {
+  JOB
+  STAGE
+  ORDER
+  SHIPMENT
+}
+
+enum CapacityUnit {
+  PIECES
+  JOBS
+  MINUTES
+}
+
+/// Configurable service-level target. Evaluation is always derived from operational timestamps; nothing is stored per target.
+/// STAGE: readyAt -> completedAt, JOB: createdAt -> completedAt (only when no target date), ORDER: confirmedAt -> deliveredAt
+/// (only when no target date), SHIPMENT: readyAt -> deliveredAt (a scheduled date wins).
+model SlaRule {
+  id                   String        @id @default(uuid()) @db.Uuid
+  code                 String        @unique
+  name                 String
+  targetType           SlaTargetType @map("target_type")
+  /// STAGE rules only: null = default for every stage without a specific rule.
+  stageDefinitionId    String?       @map("stage_definition_id") @db.Uuid
+  thresholdMinutes     Int           @map("threshold_minutes")
+  /// A warning starts this long before the deadline (default 20% of the threshold).
+  warningBeforeMinutes Int?          @map("warning_before_minutes")
+  /// e.g. { "URGENT": 0.5, "HIGH": 0.75 }: the threshold is multiplied for those priorities.
+  priorityMultipliers  Json?         @map("priority_multipliers")
+  active               Boolean       @default(true)
+  createdByUserId      String?       @map("created_by_user_id") @db.Uuid
+  createdAt            DateTime      @default(now()) @map("created_at")
+  updatedAt            DateTime      @updatedAt @map("updated_at")
+
+  stageDefinition ProductionStageDefinition? @relation(fields: [stageDefinitionId], references: [id], onDelete: Restrict)
+
+  @@index([targetType, active])
+  @@index([stageDefinitionId])
+  @@map("sla_rules")
+}
+
+/// Baseline capacity of a department (optionally narrowed to one stage definition) for a date range.
+model DepartmentCapacity {
+  id                   String         @id @default(uuid()) @db.Uuid
+  departmentType       DepartmentType @map("department_type")
+  stageDefinitionId    String?        @map("stage_definition_id") @db.Uuid
+  capacityUnit         CapacityUnit   @map("capacity_unit")
+  dailyCapacity        Int            @map("daily_capacity")
+  workingMinutesPerDay Int?           @map("working_minutes_per_day")
+  notes                String?
+  active               Boolean        @default(true)
+  effectiveFrom        DateTime       @map("effective_from") @db.Date
+  effectiveTo          DateTime?      @map("effective_to") @db.Date
+  createdByUserId      String?        @map("created_by_user_id") @db.Uuid
+  createdAt            DateTime       @default(now()) @map("created_at")
+  updatedAt            DateTime       @updatedAt @map("updated_at")
+
+  stageDefinition ProductionStageDefinition? @relation(fields: [stageDefinitionId], references: [id], onDelete: Restrict)
+
+  @@index([departmentType, active])
+  @@index([effectiveFrom, effectiveTo])
+  @@map("department_capacities")
+}
+
+/// Optional per-person capacity. Never required; department capacity is the baseline.
+model StaffCapacity {
+  id                   String    @id @default(uuid()) @db.Uuid
+  userId               String    @map("user_id") @db.Uuid
+  stageDefinitionId    String?   @map("stage_definition_id") @db.Uuid
+  workingMinutesPerDay Int       @map("working_minutes_per_day")
+  active               Boolean   @default(true)
+  effectiveFrom        DateTime  @map("effective_from") @db.Date
+  effectiveTo          DateTime? @map("effective_to") @db.Date
+  createdByUserId      String?   @map("created_by_user_id") @db.Uuid
+  createdAt            DateTime  @default(now()) @map("created_at")
+  updatedAt            DateTime  @updatedAt @map("updated_at")
+
+  user            User                       @relation(fields: [userId], references: [id], onDelete: Restrict)
+  stageDefinition ProductionStageDefinition? @relation(fields: [stageDefinitionId], references: [id], onDelete: Restrict)
+
+  @@index([userId, active])
+  @@map("staff_capacities")
+}
+
+// ───────────────────────── Phase 6B: automation and operational tools ─────────────────────────
+
+// ---- working calendar ----
+
+/// Factory working time. Weekday 0 = Sunday … 6 = Saturday; times are minutes after local midnight (0 … 1440).
+model WorkingCalendar {
+  id        String   @id @default(uuid()) @db.Uuid
+  code      String   @unique
+  name      String
+  /// IANA zone the weekly schedule and exceptions are written in.
+  timezone  String
+  isDefault Boolean  @default(false) @map("is_default")
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  days       WorkingCalendarDay[]
+  exceptions WorkingCalendarException[]
+
+  @@map("working_calendars")
+}
+
+model WorkingCalendarDay {
+  id           String  @id @default(uuid()) @db.Uuid
+  calendarId   String  @map("calendar_id") @db.Uuid
+  weekday      Int
+  isWorkingDay Boolean @map("is_working_day")
+  startMinute  Int?    @map("start_minute")
+  endMinute    Int?    @map("end_minute")
+
+  calendar WorkingCalendar @relation(fields: [calendarId], references: [id], onDelete: Cascade)
+
+  @@unique([calendarId, weekday])
+  @@map("working_calendar_days")
+}
+
+/// A holiday, an exceptional working day or a shortened day; wins over the weekly schedule.
+model WorkingCalendarException {
+  id           String   @id @default(uuid()) @db.Uuid
+  calendarId   String   @map("calendar_id") @db.Uuid
+  date         DateTime @db.Date
+  isWorkingDay Boolean  @map("is_working_day")
+  startMinute  Int?     @map("start_minute")
+  endMinute    Int?     @map("end_minute")
+  reason       String?
+
+  calendar WorkingCalendar @relation(fields: [calendarId], references: [id], onDelete: Cascade)
+
+  @@unique([calendarId, date])
+  @@map("working_calendar_exceptions")
+}
+
+// ---- outbox, notifications, templates, preferences ----
+
+enum OutboxStatus {
+  PENDING
+  PROCESSING
+  PROCESSED
+  FAILED
+}
+
+enum NotificationChannel {
+  IN_APP
+  EMAIL
+  WHATSAPP
+}
+
+enum NotificationStatus {
+  PENDING
+  PROCESSING
+  SENT
+  FAILED
+  CANCELLED
+}
+
+enum NotificationSeverity {
+  INFO
+  WARNING
+  CRITICAL
+}
+
+enum NotificationRecipientKind {
+  STAFF
+  CUSTOMER
+}
+
+/// Written in the SAME transaction as the business change; a worker turns it into notifications later.
+model OutboxEvent {
+  id               String       @id @default(uuid()) @db.Uuid
+  eventType        String       @map("event_type")
+  aggregateType    String       @map("aggregate_type")
+  aggregateId      String       @map("aggregate_id")
+  /// Identifiers and safe facts only: never secrets, tokens or signed URLs.
+  payload          Json
+  occurredAt       DateTime     @default(now()) @map("occurred_at")
+  status           OutboxStatus @default(PENDING)
+  attempts         Int          @default(0)
+  nextAttemptAt    DateTime     @default(now()) @map("next_attempt_at")
+  lockedAt         DateTime?    @map("locked_at")
+  processedAt      DateTime?    @map("processed_at")
+  lastError        String?      @map("last_error")
+  deduplicationKey String       @unique @map("deduplication_key")
+  createdAt        DateTime     @default(now()) @map("created_at")
+
+  notifications Notification[]
+
+  @@index([status, nextAttemptAt])
+  @@index([aggregateType, aggregateId])
+  @@map("outbox_events")
+}
+
+model Notification {
+  id                String                    @id @default(uuid()) @db.Uuid
+  type              String
+  severity          NotificationSeverity      @default(INFO)
+  recipientKind     NotificationRecipientKind @map("recipient_kind")
+  recipientUserId   String?                   @map("recipient_user_id") @db.Uuid
+  customerId        String?                   @map("customer_id") @db.Uuid
+  customerContactId String?                   @map("customer_contact_id") @db.Uuid
+  channel           NotificationChannel
+  /// Delivery destination as it was when the notification was created (email / phone). Never exposed to staff lists by default.
+  recipientAddress  String?                   @map("recipient_address")
+  locale            String                    @default("en")
+  templateCode      String?                   @map("template_code")
+  templateVersion   Int?                      @map("template_version")
+  title             String
+  body              String
+  /// The substituted template variables (names, numbers: never secrets), kept for providers that need ordered template slots.
+  variables         Json?
+  entityType        String?                   @map("entity_type")
+  entityId          String?                   @map("entity_id")
+  status            NotificationStatus        @default(PENDING)
+  /// Critical notifications ignore user preferences and quiet hours.
+  critical          Boolean                   @default(false)
+  scheduledAt       DateTime?                 @map("scheduled_at")
+  nextAttemptAt     DateTime?                 @map("next_attempt_at")
+  attempts          Int                       @default(0)
+  lockedAt          DateTime?                 @map("locked_at")
+  sentAt            DateTime?                 @map("sent_at")
+  readAt            DateTime?                 @map("read_at")
+  failedAt          DateTime?                 @map("failed_at")
+  failureReason     String?                   @map("failure_reason")
+  providerMessageId String?                   @map("provider_message_id")
+  deduplicationKey  String?                   @unique @map("deduplication_key")
+  outboxEventId     String?                   @map("outbox_event_id") @db.Uuid
+  alertId           String?                   @map("alert_id") @db.Uuid
+  createdAt         DateTime                  @default(now()) @map("created_at")
+  updatedAt         DateTime                  @updatedAt @map("updated_at")
+
+  recipient User?             @relation(fields: [recipientUserId], references: [id], onDelete: Restrict)
+  customer  Customer?         @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  contact   CustomerContact?  @relation(fields: [customerContactId], references: [id], onDelete: Restrict)
+  event     OutboxEvent?      @relation(fields: [outboxEventId], references: [id], onDelete: Restrict)
+  alert     OperationalAlert? @relation(fields: [alertId], references: [id], onDelete: Restrict)
+
+  @@index([recipientUserId, channel, readAt, createdAt])
+  @@index([status, nextAttemptAt])
+  @@index([type, createdAt])
+  @@index([customerId])
+  @@index([outboxEventId])
+  @@map("notifications")
+}
+
+/// Versioned message text. Content is immutable (trigger); publish a new version to change it.
+model NotificationTemplate {
+  id              String              @id @default(uuid()) @db.Uuid
+  code            String
+  channel         NotificationChannel
+  locale          String
+  version         Int                 @default(1)
+  subject         String?
+  bodyTemplate    String              @map("body_template")
+  active          Boolean             @default(true)
+  createdByUserId String?             @map("created_by_user_id") @db.Uuid
+  createdAt       DateTime            @default(now()) @map("created_at")
+
+  @@unique([code, channel, locale, version])
+  @@index([code, channel, locale, active])
+  @@map("notification_templates")
+}
+
+model UserNotificationPreference {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  category  String
+  inApp     Boolean  @default(true) @map("in_app")
+  email     Boolean  @default(true)
+  whatsapp  Boolean  @default(false)
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, category])
+  @@map("user_notification_preferences")
+}
+
+/// Prepared for a future customer portal; today staff record it on the customer's behalf.
+model CustomerNotificationPreference {
+  id         String   @id @default(uuid()) @db.Uuid
+  customerId String   @map("customer_id") @db.Uuid
+  category   String
+  email      Boolean  @default(true)
+  whatsapp   Boolean  @default(true)
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@unique([customerId, category])
+  @@map("customer_notification_preferences")
+}
+
+// ---- automation: alerts, escalation, rules, scheduler ----
+
+enum AlertStatus {
+  OPEN
+  RESOLVED
+}
+
+enum AutomationAudience {
+  ROLE
+  PERMISSION
+  STAGE_ASSIGNEES
+  JOB_ASSIGNEES
+  ALERT_RESPONSIBLE
+  SALES_OWNER
+  CUSTOMER
+}
+
+enum EscalationRecipientKind {
+  ROLE
+  RESPONSIBLE_DEPARTMENT
+}
+
+/// An incident the scheduler detected. Stops the same unchanged problem from notifying on every run.
+model OperationalAlert {
+  id                   String                @id @default(uuid()) @db.Uuid
+  type                 String
+  entityType           String                @map("entity_type")
+  entityId             String                @map("entity_id")
+  /// `${type}:${entityType}:${entityId}`; at most one OPEN alert per fingerprint.
+  fingerprint          String
+  status               AlertStatus           @default(OPEN)
+  severity             NotificationSeverity
+  lastNotifiedSeverity NotificationSeverity? @map("last_notified_severity")
+  reference            String
+  title                String
+  reason               String
+  department           String?
+  context              Json?
+  firstDetectedAt      DateTime              @map("first_detected_at")
+  lastDetectedAt       DateTime              @map("last_detected_at")
+  resolvedAt           DateTime?             @map("resolved_at")
+  lastNotifiedAt       DateTime?             @map("last_notified_at")
+  escalationLevel      Int                   @default(0) @map("escalation_level")
+  createdAt            DateTime              @default(now()) @map("created_at")
+
+  notifications Notification[]
+
+  @@index([status, type])
+  @@index([entityType, entityId])
+  @@index([fingerprint])
+  @@map("operational_alerts")
+}
+
+/// "Alert X still open after N working minutes → notify this audience". Each level fires once.
+model EscalationRule {
+  id                String                  @id @default(uuid()) @db.Uuid
+  code              String                  @unique
+  alertType         String                  @map("alert_type")
+  minSeverity       NotificationSeverity?   @map("min_severity")
+  level             Int
+  afterMinutes      Int                     @map("after_minutes")
+  recipientKind     EscalationRecipientKind @map("recipient_kind")
+  recipientRoleCode String?                 @map("recipient_role_code")
+  channels          NotificationChannel[]
+  critical          Boolean                 @default(false)
+  active            Boolean                 @default(true)
+  createdAt         DateTime                @default(now()) @map("created_at")
+  updatedAt         DateTime                @updatedAt @map("updated_at")
+
+  @@index([alertType, active])
+  @@map("escalation_rules")
+}
+
+/// Who hears about a supported event, over which channels, with which template. Not a rules engine.
+model AutomationRule {
+  id            String                @id @default(uuid()) @db.Uuid
+  code          String                @unique
+  eventType     String                @map("event_type")
+  /// ALERT_* events only: restrict to one attention type.
+  alertType     String?               @map("alert_type")
+  minSeverity   NotificationSeverity? @map("min_severity")
+  audience      AutomationAudience
+  audienceValue String?               @map("audience_value")
+  channels      NotificationChannel[]
+  templateCode  String                @map("template_code")
+  severity      NotificationSeverity  @default(INFO)
+  critical      Boolean               @default(false)
+  active        Boolean               @default(true)
+  createdAt     DateTime              @default(now()) @map("created_at")
+  updatedAt     DateTime              @updatedAt @map("updated_at")
+
+  @@index([eventType, active])
+  @@map("automation_rules")
+}
+
+model SchedulerRun {
+  id         String    @id @default(uuid()) @db.Uuid
+  task       String
+  status     String
+  startedAt  DateTime  @map("started_at")
+  finishedAt DateTime? @map("finished_at")
+  details    Json?
+  error      String?
+
+  @@index([task, startedAt])
+  @@map("scheduler_runs")
+}
+
+// ---- QR job cards and tech packs ----
+
+/// QR identity of a job. Only the SHA-256 of the token is stored; the token is shown once. Scanning never authenticates.
+model FactoryJobQrToken {
+  id              String    @id @default(uuid()) @db.Uuid
+  jobId           String    @map("job_id") @db.Uuid
+  tokenHash       String    @unique @map("token_hash")
+  createdByUserId String    @map("created_by_user_id") @db.Uuid
+  createdAt       DateTime  @default(now()) @map("created_at")
+  revokedAt       DateTime? @map("revoked_at")
+  revokedByUserId String?   @map("revoked_by_user_id") @db.Uuid
+  rotatedFromId   String?   @map("rotated_from_id") @db.Uuid
+  lastScannedAt   DateTime? @map("last_scanned_at")
+
+  job       FactoryJob @relation(fields: [jobId], references: [id], onDelete: Restrict)
+  createdBy User       @relation("QrCreated", fields: [createdByUserId], references: [id], onDelete: Restrict)
+  revokedBy User?      @relation("QrRevoked", fields: [revokedByUserId], references: [id], onDelete: Restrict)
+
+  @@index([jobId])
+  @@map("factory_job_qr_tokens")
+}
+
+enum TechPackStatus {
+  DRAFT
+  ISSUED
+  SUPERSEDED
+}
+
+enum TechPackSource {
+  SAMPLE
+  ORDER
+}
+
+/// Operational document for the factory (not a customer approval). One pack per sample or order, many versions.
+model TechPack {
+  id         String         @id @default(uuid()) @db.Uuid
+  /// TPK-000001
+  reference  String         @unique
+  sourceType TechPackSource @map("source_type")
+  sampleId   String?        @unique @map("sample_id") @db.Uuid
+  orderId    String?        @unique @map("order_id") @db.Uuid
+  createdAt  DateTime       @default(now()) @map("created_at")
+
+  sample   Sample?           @relation(fields: [sampleId], references: [id], onDelete: Restrict)
+  order    Order?            @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  versions TechPackVersion[]
+
+  @@map("tech_packs")
+}
+
+/// A frozen snapshot generated from the frozen production truth. Content never changes (trigger).
+model TechPackVersion {
+  id                     String         @id @default(uuid()) @db.Uuid
+  techPackId             String         @map("tech_pack_id") @db.Uuid
+  version                Int
+  status                 TechPackStatus @default(DRAFT)
+  content                Json
+  contentHash            String         @map("content_hash")
+  /// SAMPLE: the PRE_PRODUCTION spec. ORDER: the APPROVED_REFERENCE spec …
+  sampleProductionSpecId String         @map("sample_production_spec_id") @db.Uuid
+  /// … plus the order specification (quantities, size breakdown) in force.
+  orderProductionSpecId  String?        @map("order_production_spec_id") @db.Uuid
+  documentAssetId        String?        @map("document_asset_id") @db.Uuid
+  generatedByUserId      String         @map("generated_by_user_id") @db.Uuid
+  generatedAt            DateTime       @default(now()) @map("generated_at")
+  issuedByUserId         String?        @map("issued_by_user_id") @db.Uuid
+  issuedAt               DateTime?      @map("issued_at")
+  supersededAt           DateTime?      @map("superseded_at")
+  supersededReason       String?        @map("superseded_reason")
+
+  techPack    TechPack             @relation(fields: [techPackId], references: [id], onDelete: Restrict)
+  spec        SampleProductionSpec @relation(fields: [sampleProductionSpecId], references: [id], onDelete: Restrict)
+  orderSpec   OrderProductionSpec? @relation(fields: [orderProductionSpecId], references: [id], onDelete: Restrict)
+  document    Asset?               @relation(fields: [documentAssetId], references: [id], onDelete: Restrict)
+  generatedBy User                 @relation("TechPackGenerated", fields: [generatedByUserId], references: [id], onDelete: Restrict)
+  issuedBy    User?                @relation("TechPackIssued", fields: [issuedByUserId], references: [id], onDelete: Restrict)
+
+  @@unique([techPackId, version])
+  @@index([status])
+  @@map("tech_pack_versions")
+}
+
+/// Default responsibility for an operational area (stage definition code, or DELIVERY for shipments).
+/// GLOBAL rows apply to every customer; a CUSTOMER row overrides the global one for that customer only.
+/// Rules only ever drive FUTURE work: stages and shipments copy the owner when they are created.
+model ResponsibilityRule {
+  id                String              @id @default(uuid()) @db.Uuid
+  scope             ResponsibilityScope
+  customerId        String?             @map("customer_id") @db.Uuid
+  /// Stable key: ProductionStageDefinition.code, or "DELIVERY".
+  stageKey          String              @map("stage_key")
+  primaryUserId     String              @map("primary_user_id") @db.Uuid
+  /// Optional extra eligible workers added next to the primary owner.
+  additionalUserIds String[]            @default([]) @map("additional_user_ids") @db.Uuid
+  createdByUserId   String              @map("created_by_user_id") @db.Uuid
+  updatedByUserId   String              @map("updated_by_user_id") @db.Uuid
+  createdAt         DateTime            @default(now()) @map("created_at")
+  updatedAt         DateTime            @updatedAt @map("updated_at")
+
+  customer    Customer? @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  primaryUser User      @relation("ResponsibilityPrimary", fields: [primaryUserId], references: [id], onDelete: Restrict)
+
+  @@unique([customerId, stageKey])
+  @@index([stageKey])
+  @@index([primaryUserId])
+  @@map("responsibility_rules")
+}

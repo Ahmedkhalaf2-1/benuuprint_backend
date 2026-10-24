@@ -1,0 +1,74 @@
+# Default dev workflow: only PostgreSQL runs in Docker (`pnpm db:up`);
+# run the API locally with `pnpm dev`.
+# Credentials come from .env (see .env.example); nothing secret is hardcoded here.
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: benue-print-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+    ports:
+      - '${POSTGRES_PORT:-5433}:5432'
+    volumes:
+      - benue_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # Production-like API container. Opt-in: `docker compose --profile app up -d --build`
+  api:
+    profiles: ['app']
+    build:
+      context: .
+      target: runtime
+    image: benue-print-api:local
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      SWAGGER_ENABLED: ${SWAGGER_ENABLED:-false}
+      TRUST_PROXY: ${TRUST_PROXY:-true}
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?set JWT_ACCESS_SECRET in .env}
+      JWT_CUSTOMER_SECRET: ${JWT_CUSTOMER_SECRET:-}
+      JWT_ACCESS_TTL_SECONDS: ${JWT_ACCESS_TTL_SECONDS:-900}
+      REFRESH_TOKEN_TTL_DAYS: ${REFRESH_TOKEN_TTL_DAYS:-14}
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+      AUTH_RATE_LIMIT_PER_MINUTE: ${AUTH_RATE_LIMIT_PER_MINUTE:-10}
+      CUSTOMER_ACTION_RATE_LIMIT_PER_MINUTE: ${CUSTOMER_ACTION_RATE_LIMIT_PER_MINUTE:-30}
+      STORAGE_PROVIDER: local
+      STORAGE_LOCAL_ROOT: /app/storage
+      STORAGE_MAX_FILE_BYTES: ${STORAGE_MAX_FILE_BYTES:-20971520}
+      STORAGE_SIGNED_URL_TTL_SECONDS: ${STORAGE_SIGNED_URL_TTL_SECONDS:-300}
+      INVITATION_TTL_HOURS: ${INVITATION_TTL_HOURS:-72}
+      PASSWORD_RESET_TTL_MINUTES: ${PASSWORD_RESET_TTL_MINUTES:-60}
+      CUSTOMER_EMAIL_VERIFICATION_REQUIRED: ${CUSTOMER_EMAIL_VERIFICATION_REQUIRED:-true}
+      EMAIL_VERIFICATION_TTL_HOURS: ${EMAIL_VERIFICATION_TTL_HOURS:-24}
+      DEFAULT_CURRENCY: ${DEFAULT_CURRENCY:-EGP}
+      BUSINESS_TIMEZONE: ${BUSINESS_TIMEZONE:-Africa/Cairo}
+      EMAIL_PROVIDER: ${EMAIL_PROVIDER:-disabled}
+      WHATSAPP_PROVIDER: ${WHATSAPP_PROVIDER:-disabled}
+      SCHEDULER_ENABLED: ${SCHEDULER_ENABLED:-true}
+      PUBLIC_APP_URL: ${PUBLIC_APP_URL:-}
+      EXPOSE_ONE_TIME_TOKENS: ${EXPOSE_ONE_TIME_TOKENS:-}
+      # Inside the compose network the database host is the service name.
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+    ports:
+      - '${API_PORT:-3000}:3000'
+    volumes:
+      # Private uploaded files (assets). Replace with object storage for multi-node deployments.
+      - benue_api_storage:/app/storage
+
+volumes:
+  benue_postgres_data:
+  benue_api_storage:
