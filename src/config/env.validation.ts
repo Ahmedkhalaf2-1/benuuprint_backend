@@ -196,5 +196,14 @@ export function validateEnv(config: Record<string, unknown>): Env {
       .join('; ');
     throw new Error(`Invalid environment configuration: ${details}`);
   }
+  // A wildcard origin together with credentialed requests is never acceptable in production.
+  if (
+    result.data.NODE_ENV === 'production' &&
+    result.data.CORS_ORIGINS.split(',').some((origin) => origin.trim() === '*')
+  ) {
+    throw new Error(
+      'Invalid environment configuration: CORS_ORIGINS: a wildcard origin is not allowed in production',
+    );
+  }
   return result.data;
 }

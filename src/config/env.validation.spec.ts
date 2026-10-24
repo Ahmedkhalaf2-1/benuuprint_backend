@@ -23,6 +23,20 @@ describe('validateEnv', () => {
     expect(env.SWAGGER_ENABLED).toBe(false);
   });
 
+  it('rejects a wildcard CORS origin in production only', () => {
+    expect(() =>
+      validateEnv({ ...base, NODE_ENV: 'production', CORS_ORIGINS: '*' }),
+    ).toThrow(/wildcard/);
+    expect(validateEnv({ ...base, CORS_ORIGINS: '*' }).CORS_ORIGINS).toBe('*');
+    expect(
+      validateEnv({
+        ...base,
+        NODE_ENV: 'production',
+        CORS_ORIGINS: 'https://a.example, https://www.a.example',
+      }).CORS_ORIGINS,
+    ).toContain('www.a.example');
+  });
+
   it('rejects a missing DATABASE_URL', () => {
     expect(() => validateEnv({})).toThrow(/DATABASE_URL/);
   });
